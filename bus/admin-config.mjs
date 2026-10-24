@@ -4,11 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { BUS_DIR, POLICY_PATH } from './store.mjs';
 import { KINDS } from './redline.mjs';
+import { validateValidators, verifierCwd } from './verifier.mjs';
+import { normalizeGrant, normalizeNetworkPolicy } from './network-policy.mjs';
 
 const AGENT_RE = /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*$/i;
 const AUTONOMY = ['off', 'propose', 'auto'];
 const COSTS = ['mechanical', 'tests', 'docs', 'standard', 'architectural', 'interface'];
 const PERMISSIONS = ['dispatch', 'accept', 'merge', 'reassign'];
+export const NETWORK_GRANT_LIMIT = 8;
 const DSH_MCP_BEGIN = '# >>> agentbus managed entry >>>';
 const DSH_MCP_END = '# <<< agentbus managed entry <<<';
 
@@ -37,6 +40,27 @@ function strings(v, name, allowed) {
     const s = item.trim();
     if (allowed && allowed.indexOf(s) < 0) fail(name + ' 包含不允许的值: ' + s);
     if (out.indexOf(s) < 0) out.push(s);
+  }
+  return out;
+}
+
+// policy.network：default 固定 deny；local_services 只放本地端口的精确白名单。
+function networkPolicy(input) {
+  const normalized = normalizeNetworkPolicy(input);
+  if (!normalized.ok) fail('network 无效: ' + normalized.reason);
+  return normalized.network;
+}
+
+// 任务字段 network_grants：[{ protocol, host, ports, purpose }]，逐项按网络白名单规范校验。
+export function validateNetworkGrants(input) {
+  if (input == null) return null;
+  if (!Array.isArray(input)) fail('network_grants 必须是数组');
+  if (input.length > NETWORK_GRANT_LIMIT) fail('network_grants 最多 ' + NETWORK_GRANT_LIMIT + ' 项');
+  const out = [];
+  for (const raw of input) {
+    const normalized = normalizeGrant(raw);
+    if (!normalized.ok) fail('network_grants 无效: ' + normalized.reason);
+    out.push(normalized.grant);
   }
   return out;
 }
@@ -101,11 +125,12 @@ export function validatePolicy(input, options) {
       max_dispatch_depth: integer(g.max_dispatch_depth == null ? 2 : g.max_dispatch_depth, 'global.max_dispatch_depth', 1, 5),
       max_chain_len: integer(g.max_chain_len == null ? 3 : g.max_chain_len, 'global.max_chain_len', 1, 10),
       rate_per_agent_per_hour: integer(g.rate_per_agent_per_hour == null ? 20 : g.rate_per_agent_per_hour, 'global.rate_per_agent_per_hour', 1, 1000),
+      require_credentials: bool(g.require_credentials === true, 'global.require_credentials'),
     },
+    network: networkPolicy(input.network),
     economics: {
       lead_may_read_files: bool(e.lead_may_read_files === true, 'economics.lead_may_read_files'),
       lead_may_write_code: bool(e.lead_may_write_code === true, 'economics.lead_may_write_code'),
-      lead_plans_once: bool(e.lead_plans_once !== false, 'economics.lead_plans_once'),
       lead_wake_on: strings(e.lead_wake_on || [], 'economics.lead_wake_on'),
       report_max_lines: integer(e.report_max_lines == null ? 40 : e.report_max_lines, 'economics.report_max_lines', 10, 500),
       report_no_raw_diff: bool(e.report_no_raw_diff !== false, 'economics.report_no_raw_diff'),
@@ -142,9 +167,24 @@ export function atomicWrite(file, content) {
   }
 }
 
+function readNetworkSection(file) {
+  try {
+    const json = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return json && typeof json === 'object' && !Array.isArray(json) ? json.network : null;
+  } catch (error) { return null; }
+}
+
 export function savePolicy(input, options) {
-  const policy = validatePolicy(input, options || {});
-  const result = atomicWrite((options && options.path) || POLICY_PATH, JSON.stringify(policy, null, 2) + '\n');
+  const opts = options || {};
+  const file = opts.path || POLICY_PATH;
+  // 调用方（例如看板策略页）可能不提交 network 段：沿用文件里的旧值，否则保存策略会把白名单抹掉。
+  let payload = input;
+  if (input && typeof input === 'object' && !Array.isArray(input) && input.network == null) {
+    const previous = readNetworkSection(file);
+    if (previous != null) payload = Object.assign({}, input, { network: previous });
+  }
+  const policy = validatePolicy(payload, opts);
+  const result = atomicWrite(file, JSON.stringify(policy, null, 2) + '\n');
   return { policy: policy, backup: result.backup };
 }
 
@@ -197,6 +237,8 @@ function withProjectRegistry(options, action) {
   finally { fs.closeSync(lock); fs.unlinkSync(lockPath); }
 }
 
+export function validateProjectValidators(input) { return validateValidators(input); }
+
 export function createProject(input, options) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('项目必须是对象');
   const id = projectId(input.id);
@@ -214,16 +256,35 @@ export function createProject(input, options) {
   if (!Array.isArray(agents) || agents.some(function (agent) { return typeof agent !== 'string' || !AGENT_RE.test(agent); })) {
     fail('项目 agents 必须为形如 codex/main 的字符串数组');
   }
+  const validators = validateProjectValidators(input.validators);
+  if (explicitPath) for (const spec of Object.values(validators)) verifierCwd(spec, target);
   const project = { path: path.normalize(target), topology, agents: agents.slice() };
   return withProjectRegistry(options, function (registry, opts) {
     if (Object.keys(registry.projects).some(function (existing) { return existing.toLowerCase() === id.toLowerCase(); })) {
       projectError('项目 id 已登记: ' + id, 409);
     }
     const configFile = path.join(project.path, 'project.json');
-    atomicWrite(configFile, JSON.stringify({ id, root: project.path, topology, agents: project.agents, managed_by: 'agentbus' }, null, 2) + '\n');
+    atomicWrite(configFile, JSON.stringify({ id, root: project.path, topology, agents: project.agents, validators, managed_by: 'agentbus' }, null, 2) + '\n');
     registry.projects[id] = project;
     atomicWrite(opts.registry, JSON.stringify(registry, null, 2) + '\n');
     return { ok: true, id, project, config_path: configFile };
+  });
+}
+
+export function saveProjectValidators(id, validators, options) {
+  projectId(id);
+  const clean = validateProjectValidators(validators);
+  return withProjectRegistry(options, function (registry) {
+    const key = Object.keys(registry.projects).find(existing => existing.toLowerCase() === id.toLowerCase());
+    if (!key) projectError('项目未登记: ' + id, 404);
+    const target = registry.projects[key].path;
+    if (typeof target !== 'string' || !path.isAbsolute(target)) fail('登记项目路径无效');
+    for (const spec of Object.values(clean)) verifierCwd(spec, target);
+    const configFile = path.join(target, 'project.json');
+    let config;
+    try { config = JSON.parse(fs.readFileSync(configFile,'utf8')); } catch (error) { fail('无法读取项目配置: '+error.message); }
+    const result = atomicWrite(configFile,JSON.stringify({...config,validators:clean},null,2)+String.fromCharCode(10));
+    return {ok:true,id:key,validators:clean,config_path:configFile,backup:result.backup};
   });
 }
 
@@ -352,7 +413,12 @@ function withoutDshManagedBlock(text) {
   return (text.slice(0, start) + text.slice(end + DSH_MCP_END.length)).replace(/\s+$/, '') + '\n';
 }
 
-function dshManagedBlock(script, agent) {
+function dshManagedBlock(script, agent, token) {
+  const envBlock = token
+    ? '        env:\n' +
+      '          AGENT_BUS_ID: ' + JSON.stringify(agent) + '\n' +
+      '          AGENT_BUS_TOKEN: ' + JSON.stringify(token) + '\n'
+    : '';
   return DSH_MCP_BEGIN + '\n' +
     '- insert:\n' +
     '    - id: agentbus\n' +
@@ -362,6 +428,7 @@ function dshManagedBlock(script, agent) {
     '        serverName: agentbus\n' +
     '        command: node\n' +
     '        args: ' + JSON.stringify([script, '--agent', agent]) + '\n' +
+    envBlock +
     DSH_MCP_END + '\n';
 }
 
@@ -369,7 +436,13 @@ function validateMcpInput(input) {
   if (!input || typeof input !== 'object') fail('MCP 配置无效');
   const enabled = input.enabled !== false;
   const agent = agentId(input.agent, 'MCP Agent ID', false);
-  return { enabled: enabled, agent: agent };
+  if (agent === 'human') fail('human 永不签发 MCP 凭据');
+  let token = null;
+  if (input.token != null) {
+    if (typeof input.token !== 'string' || !/^[a-f0-9]{64}$/.test(input.token)) fail('MCP 凭据格式无效（应为 64 位十六进制）');
+    token = input.token;
+  }
+  return { enabled: enabled, agent: agent, token: token };
 }
 
 export function saveMcpProfile(client, input, options) {
@@ -385,19 +458,30 @@ export function saveMcpProfile(client, input, options) {
     if (cfg.enabled) {
       content += '\n# Agent Bus —— Codex / Claude Code / DSH 共用的任务总线\n' +
         '[mcp_servers.agentbus]\ncommand = "node"\nargs = ' + JSON.stringify([script, '--agent', cfg.agent]) + '\n';
+      if (cfg.token) {
+        content += '[mcp_servers.agentbus.env]\n' +
+          'AGENT_BUS_ID = ' + JSON.stringify(cfg.agent) + '\n' +
+          'AGENT_BUS_TOKEN = ' + JSON.stringify(cfg.token) + '\n';
+      }
     }
   } else if (client === 'claude') {
     const json = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
     json.mcpServers = json.mcpServers || {};
-    if (cfg.enabled) json.mcpServers.agentbus = { type: 'stdio', command: 'node', args: [script, '--agent', cfg.agent], env: {} };
+    if (cfg.enabled) {
+      const env = {};
+      if (cfg.token) { env.AGENT_BUS_ID = cfg.agent; env.AGENT_BUS_TOKEN = cfg.token; }
+      json.mcpServers.agentbus = { type: 'stdio', command: 'node', args: [script, '--agent', cfg.agent], env: env };
+    }
     else delete json.mcpServers.agentbus;
     content = JSON.stringify(json, null, 2) + '\n';
   } else {
     const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
     content = withoutDshManagedBlock(current);
-    if (cfg.enabled) content += '\n' + dshManagedBlock(script, cfg.agent);
+    if (cfg.enabled) content += '\n' + dshManagedBlock(script, cfg.agent, cfg.token);
   }
   const result = atomicWrite(file, content);
+  // 配置文件含凭据，尽量收到仅当前用户可读；Windows 上 chmod 基本无效，需 ACL helper 才能完全落实
+  try { fs.chmodSync(file, 0o600); } catch (e) {}
   const profile = readMcpProfiles(options).find(function (x) { return x.id === client; });
   return { profile: profile, backup: result.backup, restart_required: true };
 }

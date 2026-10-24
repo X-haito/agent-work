@@ -6,6 +6,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as S from './store.mjs';
+import * as Creds from './auth.mjs';
+import * as AdminConfig from './admin-config.mjs';
 
 const cmd = process.argv[2] || 'status';
 const db = S.openDb();
@@ -126,10 +128,54 @@ function initProject() {
   console.log('已生成 ' + cfgPath);
 }
 
+function credentials() {
+  const action = process.argv[3] || 'list';
+  const target = process.argv[4];
+  if (action === 'list') {
+    const rows = db.prepare('SELECT agent_id,token_hash,created_at,expires_at,revoked_at,last_used_at FROM agent_credentials ORDER BY agent_id, rowid DESC').all();
+    if (!rows.length) { console.log('还没有任何 AgentBus 凭据。用: node bus/cli.mjs credentials rotate <codex|claude|dsh>'); return; }
+    for (const r of rows) {
+      const state = r.revoked_at ? 'revoked' : (r.expires_at && Date.parse(r.expires_at) <= Date.now() ? 'expired' : 'active');
+      console.log(pad(r.agent_id, 18) + pad(state, 9) + r.created_at + '  used=' + (r.last_used_at || '-') + '  ' + String(r.token_hash).slice(0, 8) + '…');
+    }
+    return;
+  }
+  if (action === 'revoke') {
+    if (!target) { console.log('用法: node bus/cli.mjs credentials revoke <agent或客户端>'); return; }
+    const agent = ['codex', 'claude', 'dsh'].indexOf(target) >= 0 ? target + '/main' : target;
+    const r = Creds.revokeCredential(db, agent);
+    Creds.logAudit(db, { actor: 'human', auth_method: 'local-cli', action: 'credentials.revoke', resource: { agent: agent }, result: String(r.revoked) });
+    console.log('已撤销 ' + r.revoked + ' 条有效凭据: ' + agent);
+    return;
+  }
+  if (action === 'rotate') {
+    const client = target || 'codex';
+    const isClient = ['codex', 'claude', 'dsh'].indexOf(client) >= 0;
+    const agent = isClient ? client + '/main' : client;
+    const rotated = Creds.rotateCredential(db, agent);
+    if (!rotated.ok) { console.log('轮换失败: ' + rotated.reason + ' ' + (rotated.message || '')); return; }
+    if (!isClient) {
+      console.log('新凭据（只显示这一次）: ' + rotated.token);
+      console.log('把它写入该 Agent 的 AGENT_BUS_TOKEN 环境变量；旧凭据宽限到 ' + rotated.grace_until);
+    } else {
+      const saved = AdminConfig.saveMcpProfile(client, { enabled: true, agent: agent, token: rotated.token });
+      console.log('已写入 ' + client + ' 配置: ' + saved.profile.path);
+      console.log('备份: ' + (saved.backup || '(无)') + '；宽限至 ' + rotated.grace_until);
+      const cleaned = Creds.revokeSuperseded(db, agent);
+      console.log('已撤销被取代的旧凭据 ' + cleaned.revoked + ' 条');
+      console.log('需要重启对应客户端才会加载新凭据。');
+    }
+    Creds.logAudit(db, { actor: 'human', auth_method: 'local-cli', action: 'credentials.rotate', resource: { agent: agent }, result: 'ok' });
+    return;
+  }
+  console.log('用法: node bus/cli.mjs credentials [list | rotate <codex|claude|dsh|agent> | revoke <agent>]');
+}
+
 const TABLE = {
   status: status, board: board, agents: agents, cost: cost,
   projects: projects, 'add-project': addProject, 'init-project': initProject,
+  credentials: credentials,
 };
 
 if (TABLE[cmd]) TABLE[cmd]();
-else console.log('用法: node bus/cli.mjs [status|board|agents|cost|projects|add-project|init-project]');
+else console.log('用法: node bus/cli.mjs [status|board|agents|cost|projects|add-project|init-project|credentials]');

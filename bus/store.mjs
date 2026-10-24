@@ -3,6 +3,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
+import { migrateDb } from './migrations.mjs';
+import { normalizeRoots } from './execution-grant.mjs';
+import { resolveValidator } from './verifier.mjs';
 import { classifyText, classifyPaths, mergeKinds, KINDS } from './redline.mjs';
 
 export const BUS_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -21,12 +24,6 @@ function pragma(db, s) {
   try { db.exec(s); } catch (e) { try { db.prepare(s).get(); } catch (e2) {} }
 }
 
-function ensureColumn(db, table, col, def) {
-  try {
-    const cols = db.prepare('PRAGMA table_info(' + table + ')').all().map(function (c) { return c.name; });
-    if (cols.indexOf(col) < 0) db.exec('ALTER TABLE ' + table + ' ADD COLUMN ' + col + ' ' + def);
-  } catch (e) {}
-}
 
 // 老库的缺列读出来是 undefined，统一当空数组
 function jsonArray(v) {
@@ -48,17 +45,87 @@ export function openDb(dbPath) {
   const db = new DatabaseSync(p);
   pragma(db, 'PRAGMA journal_mode = WAL');
   pragma(db, 'PRAGMA busy_timeout = 3000');
-  db.exec(fs.readFileSync(path.join(BUS_DIR, 'schema.sql'), 'utf8'));
-  // 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列
-  ensureColumn(db, 'tasks', 'verify_cmd', 'TEXT');
-  ensureColumn(db, 'tasks', 'extra_dirs', 'TEXT');
-  ensureColumn(db, 'tasks', 'redline', 'TEXT');
-  ensureColumn(db, 'tasks', 'grants', 'TEXT');
-  ensureColumn(db, 'tasks', 'guard', 'TEXT');
-  ensureColumn(db, 'tasks', 'changed_files', 'INTEGER');
-  ensureColumn(db, 'tasks', 'needs_human', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn(db, 'tasks', 'escalated_at', 'TEXT');
+  migrateDb(db);
   return db;
+}
+
+
+function grantTransaction(db, action) {
+  db.exec('BEGIN IMMEDIATE');
+  try { const result = action(); db.exec('COMMIT'); return result; }
+  catch (error) { db.exec('ROLLBACK'); throw error; }
+}
+
+function executionTaskError(task, owner, version) {
+  if (!task) return { ok: false, reason: 'not_found', message: '任务不存在' };
+  if (!['claimed', 'in_progress'].includes(task.status)) return { ok: false, reason: 'not_claimed', message: '任务必须处于 claimed 或 in_progress' };
+  if (task.owner !== owner) return { ok: false, reason: 'not_owner', message: '执行授权 owner 与任务不匹配' };
+  if (!task.lease_until || !Number.isFinite(Date.parse(task.lease_until)) || Date.parse(task.lease_until) <= Date.now()) return { ok: false, reason: 'lease_expired', message: '任务租约已过期' };
+  if (version !== undefined && version !== task.version) return { ok: false, reason: 'version_mismatch', message: '执行授权任务版本不匹配' };
+  return null;
+}
+
+function grantJson(row) {
+  return { grant_id: row.grant_id, task_id: row.task_id, owner: row.owner, task_version: row.task_version,
+    roots: JSON.parse(row.roots_json), redline: JSON.parse(row.redline_json), issued_at: row.issued_at, expires_at: row.expires_at };
+}
+
+export function issueExecutionGrant(db, taskId, owner, opts = {}) {
+  return grantTransaction(db, function () {
+    const task = getTask(db, taskId);
+    const failure = executionTaskError(task, owner, opts.task_version);
+    if (failure) return failure;
+    const workspace = workspaceFor(db, task.project, owner, taskId);
+    const normalized = normalizeRoots({ projectRoot: workspace.root, cwd: workspace.cwd, extraDirs: parseArray(task.extra_dirs) });
+    if (!normalized.ok) return normalized;
+    const existing = getExecutionGrant(db, taskId, owner);
+    if (existing) return { ok: true, grant: existing };
+    revokeExecutionGrant(db, taskId, 'reissued');
+    const grant = { grant_id: newId(), task_id: taskId, owner, task_version: task.version,
+      roots: normalized.roots, redline: mergeKinds(parseArray(task.redline), parseArray(task.grants)),
+      issued_at: nowIso(), expires_at: task.lease_until };
+    db.prepare('INSERT INTO execution_grants(grant_id,task_id,owner,task_version,roots_json,redline_json,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?)')
+      .run(grant.grant_id, taskId, owner, grant.task_version, JSON.stringify(grant.roots), JSON.stringify(grant.redline), grant.issued_at, grant.expires_at);
+    return { ok: true, grant };
+  });
+}
+
+export function getExecutionGrant(db, taskId, owner) {
+  const row = db.prepare("SELECT g.* FROM execution_grants g JOIN tasks t ON t.id=g.task_id WHERE g.task_id=? AND g.owner=? AND g.revoked_at IS NULL AND g.task_version=t.version AND t.owner=g.owner AND t.status IN ('claimed','in_progress') AND g.expires_at>? AND t.lease_until>? LIMIT 1").get(taskId, owner, nowIso(), nowIso());
+  return row ? grantJson(row) : null;
+}
+
+export function revokeExecutionGrant(db, taskId, reason) {
+  db.prepare('UPDATE execution_grants SET revoked_at=?,revoke_reason=? WHERE task_id=? AND revoked_at IS NULL').run(nowIso(), reason || 'revoked', taskId);
+  return { ok: true };
+}
+
+export function extendExecutionGrant(db, taskId, owner, ms) {
+  if (!Number.isSafeInteger(ms) || ms <= 0) return { ok: false, reason: 'invalid_duration', message: '续期毫秒数必须为正整数' };
+  return grantTransaction(db, function () {
+    const task = getTask(db, taskId);
+    const failure = executionTaskError(task, owner);
+    if (failure) return failure;
+    const grant = getExecutionGrant(db, taskId, owner);
+    if (!grant) return { ok: false, reason: 'grant_invalid', message: '执行授权不存在或已失效' };
+    const expires = new Date(Math.min(Date.parse(task.lease_until), Date.now() + ms)).toISOString();
+    db.prepare('UPDATE execution_grants SET expires_at=? WHERE grant_id=? AND revoked_at IS NULL').run(expires, grant.grant_id);
+    return { ok: true };
+  });
+}
+
+export function deferExecutionTask(db, taskId, owner, message) {
+  return grantTransaction(db, function () {
+    const task = getTask(db, taskId);
+    const failure = executionTaskError(task, owner);
+    if (failure) return failure;
+    const note = '执行端不支持强隔离' + (message ? ': ' + message : '');
+    db.prepare("UPDATE tasks SET status='proposed',needs_human=1,owner=NULL,lease_until=NULL,version=version+1,decline_reason=?,updated_at=? WHERE id=? AND version=?").run(note, nowIso(), taskId, task.version);
+    revokeExecutionGrant(db, taskId, 'isolation_unsupported');
+    logGuardEvent(db, { task_id: taskId, agent: owner, kind: 'execution_isolation', detail: note, action: 'needs_human', actor: owner });
+    send(db, { sender: owner, to: 'human', thread: taskId, kind: 'task.proposed', body: note, refs: { task: taskId } });
+    return { ok: true, task: getTask(db, taskId) };
+  });
 }
 
 export function getRuntimeState(db) {
@@ -199,7 +266,7 @@ export function listTasks(db, f) {
   if (f && f.owner) { where.push('owner = ?'); args.push(f.owner); }
   if (f && f.project) { where.push('project = ?'); args.push(f.project); }
   const sql = 'SELECT id,title,body,project,status,owner,origin,dispatched_by,target,depth,cost_class,' +
-    'write_scope,max_subagents,verify_cmd,extra_dirs,redline,grants,guard,changed_files,needs_human,escalated_at,' +
+    'write_scope,max_subagents,verify_cmd,verify_id,verify_spec_json,verify_spec_hash,extra_dirs,network_grants,redline,grants,guard,changed_files,needs_human,escalated_at,' +
     'version,lease_until,decline_reason,created_at,updated_at FROM tasks WHERE ' +
     where.join(' AND ') + ' ORDER BY id LIMIT 200';
   return db.prepare(sql).all(...args);
@@ -210,12 +277,12 @@ export function createTask(db, t) {
   const ts = nowIso();
   db.prepare(
     'INSERT INTO tasks(id,title,body,project,status,owner,origin,dispatched_by,target,depth,cost_class,' +
-    'write_scope,max_subagents,verify_cmd,extra_dirs,redline,grants,version,created_at,updated_at) ' +
-    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+    'write_scope,max_subagents,verify_cmd,verify_id,verify_spec_json,verify_spec_hash,extra_dirs,network_grants,redline,grants,version,created_at,updated_at) ' +
+    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
   ).run(id, t.title, t.body || null, t.project || 'default', t.status, null, t.origin || 'human',
     t.dispatched_by || null, t.target || null, t.depth || 0, t.cost_class || 'standard',
     t.write_scope ? JSON.stringify(t.write_scope) : null, t.max_subagents || 0,
-    t.verify_cmd || null, t.extra_dirs ? JSON.stringify(t.extra_dirs) : null,
+    t.verify_cmd || null, t.verify_id || null, t.verify_spec_json || null, t.verify_spec_hash || null, t.extra_dirs ? JSON.stringify(t.extra_dirs) : null, jsonArray(t.network_grants),
     jsonArray(t.redline), jsonArray(t.grants), 0, ts, ts);
   return getTask(db, id);
 }
@@ -232,24 +299,39 @@ function verifyCommandRequired(policy, task) {
   const economics = policy.economics || {};
   const automatic = Array.isArray(economics.auto_accept) ? economics.auto_accept : [];
   if (economics.require_verify_cmd === true && automatic.indexOf(task.cost_class || 'standard') >= 0 &&
-      (typeof task.verify_cmd !== 'string' || !task.verify_cmd.trim())) {
-    return { ok: false, reason: 'verify_cmd_required', message: '自动验收类别 ' + (task.cost_class || 'standard') + ' 必须提供非空 verify_cmd 验证命令' };
+      (typeof task.verify_id !== 'string' || !task.verify_id.trim())) {
+    return { ok: false, reason: 'verify_cmd_required', message: '自动验收类别 ' + (task.cost_class || 'standard') + ' 必须提供非空 verify_id 项目验证器' };
   }
   return null;
+}
+
+function freezeTaskVerifier(input, actor) {
+  if (input.verify_cmd !== undefined && input.verify_cmd !== null && input.verify_cmd !== '') {
+    if (actor !== 'human') return { ok:false,reason:'legacy_verify_cmd_forbidden',message:'Agent 禁止提交自由 verify_cmd，请选择项目 verify_id' };
+    if (typeof input.verify_cmd !== 'string') return { ok:false,reason:'invalid_validator',message:'verify_cmd 必须是字符串' };
+    if (input.verify_id) return { ok:false,reason:'legacy_verify_cmd_forbidden',message:'verify_id 不能与旧 verify_cmd 同时使用' };
+    return { ok:true,fields:{verify_id:null,verify_spec_json:null,verify_spec_hash:null},legacy:true };
+  }
+  if (!input.verify_id) return { ok:true,fields:{verify_id:null,verify_spec_json:null,verify_spec_hash:null},legacy:false };
+  const resolved=resolveValidator(resolveProjectDir(input.project),input.verify_id);
+  if (!resolved.ok) return resolved;
+  return { ok:true,fields:{verify_id:input.verify_id,verify_spec_json:JSON.stringify(resolved.spec),verify_spec_hash:resolved.hash},legacy:false };
 }
 
 function createHumanTaskEnabled(db, policy, actor, t) {
   const who = actor || 'human';
   const canCreate = who === 'human' || (policy.permissions.dispatch || []).indexOf(who) >= 0;
   if (!canCreate) return { ok: false, reason: 'not_permitted', message: who + ' 没有创建/派发任务的权限' };
-  const verification = verifyCommandRequired(policy, t);
+  const frozen = freezeTaskVerifier(t, who);
+  if (!frozen.ok) return frozen;
+  const verification = frozen.legacy ? null : verifyCommandRequired(policy, t);
   if (verification) return verification;
   const kinds = mergeKinds(
     classifyText([t.title, t.body, t.verify_cmd].filter(function (x) { return !!x; }).join('\n')),
     classifyPaths(t.write_scope),
     t.grants
   );
-  const status = (t.status === 'proposed' || kinds.length) ? 'proposed' : 'open';
+  const status = (t.status === 'proposed' || frozen.legacy || kinds.length || (t.extra_dirs && t.extra_dirs.length) || (t.network_grants && t.network_grants.length)) ? 'proposed' : 'open';
   const task = createTask(db, {
     title: t.title,
     body: t.body,
@@ -263,6 +345,9 @@ function createHumanTaskEnabled(db, policy, actor, t) {
     write_scope: t.write_scope,
     max_subagents: t.max_subagents,
     verify_cmd: t.verify_cmd,
+    ...frozen.fields,
+    extra_dirs: t.extra_dirs,
+    network_grants: t.network_grants,
     redline: kinds,
     grants: t.grants || [],
   });
@@ -289,14 +374,28 @@ export function editTask(db, policy, actor, taskId, patch, expectVersion) {
     return { ok: false, reason: 'version_mismatch', message: '任务已被他人修改，当前 version=' + t.version };
   }
 
-  const structural = ['project', 'target', 'write_scope'];
+  const structural = ['project', 'target', 'write_scope', 'verify_id', 'verify_cmd', 'extra_dirs', 'grants', 'network_grants'];
   if (t.status !== 'open' && t.status !== 'proposed' && structural.some(function (k) { return Object.prototype.hasOwnProperty.call(patch, k); })) {
     return { ok: false, reason: 'task_started', message: '任务开始后不能修改项目、目标 Agent 或写作用域；请先改派任务' };
   }
 
+  const verifierChange = ['verify_id','verify_cmd','project'].some(key => Object.prototype.hasOwnProperty.call(patch,key));
+  let frozen = null;
+  if (verifierChange) {
+    const merged = { ...t,...patch };
+    if (Object.prototype.hasOwnProperty.call(patch,'verify_id') && !patch.verify_cmd) merged.verify_cmd = '';
+    frozen = freezeTaskVerifier(merged, who);
+    if (!frozen.ok) return frozen;
+    const required = frozen.legacy ? null : verifyCommandRequired(policy, merged);
+    if (required) return required;
+  }
   const sets = [];
   const args = [];
-  const allowed = ['title', 'body', 'project', 'target', 'cost_class', 'max_subagents'];
+  if (frozen) {
+    for (const [key,value] of Object.entries(frozen.fields)) { sets.push(key+'=?');args.push(value); }
+    if (Object.prototype.hasOwnProperty.call(patch,'verify_id')) { sets.push('verify_cmd=?');args.push(null); }
+  }
+  const allowed = ['title', 'body', 'project', 'target', 'cost_class', 'max_subagents', 'verify_cmd'];
   for (const key of allowed) {
     if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
     sets.push(key + '=?');
@@ -306,7 +405,18 @@ export function editTask(db, policy, actor, taskId, patch, expectVersion) {
     sets.push('write_scope=?');
     args.push(patch.write_scope && patch.write_scope.length ? JSON.stringify(patch.write_scope) : null);
   }
+  for (const key of ['extra_dirs', 'grants', 'network_grants']) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    sets.push(key + '=?');
+    args.push(JSON.stringify(patch[key] || []));
+  }
   if (!sets.length) return { ok: false, reason: 'empty_patch', message: '没有可更新的字段' };
+  const kinds = mergeKinds(classifyText([patch.title ?? t.title, patch.body ?? t.body, patch.verify_cmd ?? t.verify_cmd].filter(Boolean).join(String.fromCharCode(10))), classifyPaths(patch.write_scope ?? parseArray(t.write_scope)), patch.grants ?? parseArray(t.grants));
+  const dirs = patch.extra_dirs ?? parseArray(t.extra_dirs);
+  if (t.status === 'open' || t.status === 'proposed') {
+    sets.push('redline=?'); args.push(JSON.stringify(kinds));
+    if (kinds.length || dirs.length || (frozen && frozen.legacy)) { sets.push('status=?'); args.push('proposed'); }
+  }
   sets.push('version=version+1', 'updated_at=?');
   args.push(nowIso(), taskId, t.version);
   const r = db.prepare('UPDATE tasks SET ' + sets.join(',') + ' WHERE id=? AND version=?').run(...args);
@@ -469,8 +579,8 @@ export function updateTask(db, agent, taskId, status, note, expectVersion, accep
   if (t.owner !== agent && !accepterOnly) {
     return { ok: false, reason: 'not_owner', message: 'owner 是 ' + (t.owner || '(无)') + '，不是你；且你不具备此操作所需权限' };
   }
-  db.prepare('UPDATE tasks SET status=?, version=version+1, updated_at=?, lease_until=NULL WHERE id=?')
-    .run(status, nowIso(), taskId);
+  db.prepare("UPDATE tasks SET status=?, version=version+1, updated_at=?, lease_until=CASE WHEN ?='in_progress' THEN lease_until ELSE NULL END WHERE id=?")
+    .run(status, nowIso(), status, taskId);
   send(db, { sender: agent, to: 'thread:' + taskId, thread: taskId, kind: 'task.' + status, body: note || (taskId + ' -> ' + status), refs: { task: taskId } });
   return { ok: true, task: getTask(db, taskId) };
 }
@@ -590,10 +700,16 @@ export function decline(db, agent, taskId, reason, accepters) {
 
 // ---------- 租约 ----------
 export function renewLease(db, agent, taskId, leaseMin) {
-  const r = db.prepare(
-    "UPDATE tasks SET lease_until=? WHERE id=? AND owner=? AND status IN ('claimed','in_progress')"
-  ).run(plusMinutes(leaseMin || 15), taskId, agent);
-  return Number(r.changes) === 1;
+  return grantTransaction(db, function () {
+    const now = nowIso();
+    const expiry = plusMinutes(leaseMin || 15);
+    const grant = getExecutionGrant(db, taskId, agent);
+    const r = db.prepare("UPDATE tasks SET lease_until=? WHERE id=? AND owner=? AND status IN ('claimed','in_progress') AND lease_until>?")
+      .run(expiry, taskId, agent, now);
+    if (Number(r.changes) !== 1) return false;
+    if (grant) db.prepare('UPDATE execution_grants SET expires_at=? WHERE grant_id=? AND revoked_at IS NULL').run(expiry, grant.grant_id);
+    return true;
+  });
 }
 
 let lastReap = 0;
@@ -605,7 +721,8 @@ export function reapLeases(db, force) {
     "SELECT id, owner FROM tasks WHERE status IN ('claimed','in_progress') AND lease_until IS NOT NULL AND lease_until < ?"
   ).all(now);
   for (const r of rows) {
-    db.prepare("UPDATE tasks SET status='open', owner=NULL, lease_until=NULL, version=version+1, updated_at=? WHERE id=?").run(now, r.id);
+    const recovered = db.prepare("UPDATE tasks SET status='open', owner=NULL, lease_until=NULL, version=version+1, updated_at=? WHERE id=? AND owner=? AND status IN ('claimed','in_progress') AND lease_until < ?").run(now, r.id, r.owner, now);
+    if (Number(recovered.changes) !== 1) continue;
     send(db, { sender: 'system', to: 'broadcast', thread: r.id, kind: 'task.progress',
       body: '租约过期回收 ' + r.id + '（原 owner ' + (r.owner || '?') + '），已退回 open', refs: { task: r.id, reaped: true } });
   }
@@ -635,7 +752,9 @@ function dispatchEnabled(db, policy, from, d) {
     return { ok: false, reason: 'guard_G1_unauthorized', message: from + ' 无权向 ' + to + ' 派活（既不在 permissions.dispatch，也不在 ' + from + '.may_dispatch_to）' };
   }
 
-  const verification = verifyCommandRequired(policy, d);
+  const frozen = freezeTaskVerifier(d, from);
+  if (!frozen.ok) return frozen;
+  const verification = frozen.legacy ? null : verifyCommandRequired(policy, d);
   if (verification) return verification;
   const depth = (d.depth || 0) + 1;
   const maxDepth = g.max_dispatch_depth == null ? 2 : g.max_dispatch_depth;
@@ -650,13 +769,13 @@ function dispatchEnabled(db, policy, from, d) {
     d.grants
   );
   const grants = d.grants || [];
-  const redlineExtra = !!(d.extra_dirs && d.extra_dirs.length) || d.redline === true;
+  const redlineExtra = !!(d.extra_dirs && d.extra_dirs.length) || !!(d.network_grants && d.network_grants.length) || d.redline === true;
 
   const enabled = g.dispatch_enabled !== false;
   const autonomy = toCfg.autonomy || 'off';
   const reasons = [];
   let status = 'open';
-  if (kinds.length || redlineExtra) {
+  if (d.status === 'proposed' || kinds.length || redlineExtra || frozen.legacy) {
     status = 'proposed';
     if (!kinds.length) reasons.push('redline(需要人类批准: ' + (d.extra_dirs || []).join(', ') + ')');
   } else if (!enabled) { status = 'proposed'; reasons.push('dispatch_enabled=false'); }
@@ -673,7 +792,7 @@ function dispatchEnabled(db, policy, from, d) {
     title: d.title, body: d.body, project: d.project, status: status,
     origin: 'agent:' + from, dispatched_by: from, target: to, depth: depth,
     cost_class: d.cost_class, write_scope: d.write_scope, max_subagents: d.max_subagents,
-    verify_cmd: d.verify_cmd, extra_dirs: d.extra_dirs, redline: kinds, grants: grants,
+    verify_cmd: d.verify_cmd, ...frozen.fields, extra_dirs: d.extra_dirs, network_grants: d.network_grants, redline: kinds, grants: grants,
   });
   send(db, { sender: from, to: to, thread: task.id, kind: 'task.new', body: d.title, refs: { task: task.id, project: task.project }, hop: 1 });
   const gatedBy = kinds.length ? 'redline:' + kinds.join(',') : (reasons.join('+') || null);

@@ -91,5 +91,5 @@ export function canAutoAccept(task, policy) {
   if (listOf(task.redline).length || listOf(task.grants).length || listOf(task.extra_dirs).length) return false;
   let guard = task.guard;
   if (typeof guard === 'string') { try { guard = JSON.parse(guard); } catch (e) { return false; } }
-  return !!guard && guard.ok === true && Array.isArray(guard.hard) && guard.hard.length === 0;
+  return !!guard && guard.truncated !== true && guard.ok === true && Array.isArray(guard.hard) && guard.hard.length === 0;
 }

@@ -107,25 +107,26 @@ try {
     assert.equal(S.dispatch(db, policy, 'lead', { to: 'worker', title: 'dispatch', cost_class: 'trivial' }).ok, true);
   });
   policy.economics.require_verify_cmd = true;
-  check('switch on rejects empty automatic-class commands without creating cards or events', () => {
+  check('switch on rejects empty automatic-class validators without creating cards or events', () => {
     const tasksBefore = db.prepare('SELECT COUNT(*) AS n FROM tasks').get().n;
     const messagesBefore = db.prepare('SELECT COUNT(*) AS n FROM messages').get().n;
-    for (const verify_cmd of [undefined, '', '  \n\t', 42]) {
+    for (const verify_id of [undefined, '']) {
       for (const result of [
-        S.createHumanTask(db, policy, 'human', { title: 'manual', cost_class: 'trivial', verify_cmd }),
-        S.dispatch(db, policy, 'lead', { to: 'worker', title: 'dispatch', cost_class: 'trivial', verify_cmd }),
+        S.createHumanTask(db, policy, 'human', { title: 'manual', cost_class: 'trivial', verify_id }),
+        S.dispatch(db, policy, 'lead', { to: 'worker', title: 'dispatch', cost_class: 'trivial', verify_id }),
       ]) {
         assert.equal(result.reason, 'verify_cmd_required');
-        assert.match(result.message, /trivial.*verify_cmd/);
+        assert.match(result.message, /trivial.*verify_id/);
       }
     }
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM tasks').get().n, tasksBefore);
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, messagesBefore);
   });
-  check('switch on permits nonempty commands for automatic classes', () => {
-    const verify_cmd = 'Write-Output passed';
-    assert.equal(S.createHumanTask(db, policy, 'human', { title: 'manual', cost_class: 'trivial', verify_cmd }).ok, true);
-    assert.equal(S.dispatch(db, policy, 'lead', { to: 'worker', title: 'dispatch', cost_class: 'trivial', verify_cmd }).ok, true);
+  check('switch on permits registered validator IDs for automatic classes', () => {
+    const verify_id = 'smoke';
+    fs.writeFileSync(path.join(tmp, 'project.json'),JSON.stringify({validators:{smoke:{command:'node',args:[],cwd:'.',timeout_ms:1000}}}));
+    assert.equal(S.createHumanTask(db, policy, 'human', { title: 'manual', project:tmp, cost_class: 'trivial', verify_id }).ok, true);
+    assert.equal(S.dispatch(db, policy, 'lead', { to: 'worker', title: 'dispatch', project:tmp, cost_class: 'trivial', verify_id }).ok, true);
   });
   check('other cost classes remain unrestricted with switch on', () => {
     assert.equal(S.createHumanTask(db, policy, 'human', { title: 'manual', cost_class: 'standard' }).ok, true);

@@ -14,8 +14,16 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import * as S from './store.mjs';
+import { leadPermissions, reportText, filterLeadWake } from './policy-runtime.mjs';
 import * as G from './guard.mjs';
+import { runVerifier, validateFrozenVerifier } from './verifier.mjs';
+import * as CodexEngine from './engines/codex.mjs';
+import * as ClaudeEngine from './engines/claude.mjs';
+import * as DshEngine from './engines/dsh.mjs';
+
 import { mergeKinds } from './redline.mjs';
+import { startEgressProxy, proxyEnv } from './egress-proxy.mjs';
+import { recordEvent } from './network-policy.mjs';
 import { routeMessages, refTaskId, canAutoAccept } from './message-routing.mjs';
 
 function argOf(name, def) {
@@ -26,6 +34,27 @@ function argOf(name, def) {
 const flag = (n) => process.argv.indexOf('--' + n) >= 0;
 
 const ENGINE = String(argOf('engine', process.env.BUS_SUPERVISOR_ENGINE || 'claude')).toLowerCase();
+const TASK_ENGINE = ENGINE === 'dsh' ? DshEngine : ClaudeEngine;
+
+// ---------- 网络出口 ----------
+// 能力做不到就不装样子：联网任务在 admitTask 里已经转 proposed + needs_human；
+// 这里只在执行端真能强制隔离时才起代理，并把地址注入子进程的 HTTP(S)_PROXY。
+// 落库统一走 network-policy.recordEvent（字段白名单 + 值脱敏），本文件不拼 SQL。
+function recordEgress(event) {
+  try { recordEvent(db, event); } catch (error) { log('network_events 写入失败: ' + String((error && error.message) || error)); }
+  log('egress ' + [event.decision, event.protocol, event.host, event.port, event.resolved_ip, event.status_code, event.bytes]
+    .filter(value => value != null).join(' '));
+}
+
+async function startTaskEgress(task, engine, cfg, sink) {
+  const grants = CodexEngine.networkGrantsOf(task);
+  if (!grants.length) return null;
+  const caps = (engine && typeof engine.capabilities === 'function' ? engine.capabilities() : null) || {};
+  if (caps.networkIsolation !== true) { log('联网任务没有强制隔离（仅审计），不启动代理: ' + task.id); return null; }
+  const proxy = await startEgressProxy({ policy: cfg, grant: grants, taskId: task.id, log: sink });
+  log('联网任务 ' + task.id + ' 使用本地审计代理 ' + proxy.url + '（仅审计，无法强制隔离）');
+  return { url: proxy.url, env: proxyEnv(proxy.url), close: proxy.close };
+}
 if (ENGINE !== 'claude' && ENGINE !== 'dsh') throw new Error('不支持的 supervisor engine: ' + ENGINE);
 const AGENT = argOf('agent', process.env.AGENT_BUS_ID || (ENGINE === 'dsh' ? 'dsh/main' : 'claude/main'));
 const PERM = argOf('permission-mode', 'acceptEdits');
@@ -113,9 +142,7 @@ const CURSOR_KEY = AGENT + '#' + ENGINE + '-sup';   // 守护进程独立收件�
 function log(m) { process.stderr.write('[' + ENGINE + '-sup] ' + m + '\n'); }
 
 function bounded(text) {
-  const lines = String(text || '').trim().split('\n');
-  if (lines.length <= REPORT_MAX) return lines.join('\n');
-  return lines.slice(0, REPORT_MAX).join('\n') + '\n…（已截断，共 ' + lines.length + ' 行）';
+  return reportText(text, policy, REPORT_MAX);
 }
 
 // prompt 必须和任务卡的实际授权一致。写死"只在工作目录内"会让带 extra_dirs 的任务自相矛盾，
@@ -147,6 +174,18 @@ function grantLine(task) {
   if (!kinds.length) return '   · 授权红线：无（删文件、装依赖、改受保护配置、危险 git、外网访问一律不许做）';
   return '   · 授权红线：有（' + kinds.map(function (k) { return KIND_CN[k] || k; }).join('、') +
     '）—— 有授权的操作也必须限于已授权范围';
+}
+
+// 光写"可能联网"不够：把已批准的目标和"无法强制"一起说清，别让 agent 以为白名单能兜底。
+function networkLine(task) {
+  const kinds = mergeKinds(task.grants, task.redline);
+  if (kinds.indexOf('net:egress') < 0) return '';
+  const targets = CodexEngine.networkGrantsOf(task).map(function (g) {
+    return g.protocol + '://' + g.host + ':' + (Array.isArray(g.ports) ? g.ports.join('|') : String(g.ports));
+  }).join(', ');
+  return '   · 联网：只允许访问已批准的目标 ' + (targets || '(未批准任何目标)') +
+    '；出口经本地代理审计（只记协议/主机/端口，不记 Authorization、Cookie、query 与正文）。' +
+    '代理只是审计，无法阻止你绕过它直接建连，绕过视为违约。';
 }
 
 // min(卡上上限, 政策上限)；任一侧取不到就按 0 —— 默认禁止，fail-safe
@@ -181,6 +220,7 @@ function buildTaskPrompt(task, ws) {
     '【要求】',
     scopeLine(task, ws),
     grantLine(task),
+    networkLine(task),
     subagentLine(task),
     outsideLine(task),
     '2. 不要去调用总线工具，supervisor 已经替你认领，结束后由它回报状态。',
@@ -226,8 +266,11 @@ function buildMessagePrompt(msgs) {
 }
 
 function runnerArgs(prompt, dirs) {
-  if (ENGINE === 'dsh') return ['--profile', DSH_PROFILE, '--patch', DSH_PATCH, '--json', prompt];
-  const a = ['-p', prompt, '--permission-mode', PERM, '--output-format', 'json'];
+  if (ENGINE === 'dsh') {
+    if (IS_LEAD && leadPermissions(policy, IS_LEAD).restricted) log('警告: DSH 不支持权限参数，仅能靠 patch 关闭写工具');
+    return ['--profile', DSH_PROFILE, '--patch', DSH_PATCH, '--json', prompt];
+  }
+  const a = ['-p', prompt, '--permission-mode', leadPermissions(policy, IS_LEAD).restricted ? 'plan' : PERM, '--output-format', 'json'];
   // 工作目录之外的写入需要显式授权，否则会被权限层拦掉
   if (dirs && dirs.length) a.push('--add-dir', ...dirs);
   return a;
@@ -326,17 +369,6 @@ function summarize(raw) {
 
 // 机械验收：任务卡可以带一条命令，退出码 0 才算过。
 // 光看 agent 退出码不够 —— 实测过"会话成功但任务没做完"的情况（is_error=false, subtype=success）。
-function runVerify(cmd) {
-  return new Promise(function (resolve) {
-    const child = spawn('pwsh', ['-NoProfile', '-Command', cmd], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    let out = '';
-    child.stdout.on('data', function (d) { out += d.toString(); });
-    child.stderr.on('data', function (d) { out += d.toString(); });
-    child.on('error', function (e) { resolve({ ok: false, out: String(e && e.message || e) }); });
-    child.on('close', function (code) { resolve({ ok: code === 0, out: out }); });
-  });
-}
-
 function saveRawLog(taskId, raw) {
   try {
     const dir = path.join(S.BUS_DIR, 'logs');
@@ -348,45 +380,27 @@ function saveRawLog(taskId, raw) {
 }
 
 // ---------- 事后审计：运行前快照，运行后 diff ----------
-// 快照要同时覆盖 cwd（相对 key）和 extra_dirs（绝对路径 key）：
-// 只有绝对 key 才会被 audit 的 insideAny() 认成"在授权范围内"，extra_dirs 里的删除也才抓得到。
-function snapshotAll(task, ws) {
-  const files = {};
-  const seen = new Set();
-  let truncated = false;
-  let scanned = 0;
-  const take = function (root, prefix) {
-    const s = G.snapshot(root);
-    if (s.truncated) truncated = true;
-    scanned += s.scanned;
-    for (const k of Object.keys(s.files)) {
-      const full = path.resolve(root, k);
-      if (seen.has(full)) continue;          // cwd 与 extra_dirs 重叠时不要重复计数
-      seen.add(full);
-      files[prefix ? prefix + '/' + k : k] = s.files[k];
-    }
-  };
-  if (ws && ws.cwd) take(ws.cwd, '');
-  for (const d of extraDirsOf(task)) take(d, path.resolve(d).replace(/\\/g, '/'));
-  return { files: files, truncated: truncated, scanned: scanned };
-}
+// 快照仅扫描签发授权中的真实根目录。
+function snapshotAll(task, ws, grant) { return G.snapshotGrant(grant); }
 
 // 审计落地：先写三列，再由调用方决定放行还是拦。
-// 审计自己抛异常不能把任务卡死 —— 写 guard={error} 后仍按原逻辑提交 review。
-function auditRun(task, ws, before, beforeErr) {
+// 审计异常和截断交由 Human 验收。
+function auditRun(task, ws, before, beforeErr, grant) {
   try {
     if (!before) throw new Error(beforeErr || '运行前快照缺失');
-    const after = snapshotAll(task, ws);
-    const a = G.audit({ task: task, ws: ws, before: before, after: after, policy: policy });
+    const after = snapshotAll(task, ws, grant);
+    const a = G.audit({ task: task, ws: ws, before: before, after: after, policy: policy, grant: grant });
     const wide = (a.soft || []).some(function (s) { return s.kind === 'wide:change'; });
-    const needs = (a.hard && a.hard.length) ? 1 : (wide ? 1 : 0);
+    const meta = G.recordGrantAudit(db, task, AGENT, grant, before, after);
+    Object.assign(a, meta);
+    const needs = (a.hard && a.hard.length) || wide || meta.truncated ? 1 : 0;
     S.setGuard(db, task.id, { guard: a, changed_files: a.changed_files, needs_human: needs });
     return a;
   } catch (e) {
     const err = { error: String((e && e.message) || e) };
-    try { S.setGuard(db, task.id, { guard: err, changed_files: 0, needs_human: 0 }); } catch (e2) {}
-    log('审计失败，按原逻辑放行: ' + err.error);
-    return null;
+    try { S.setGuard(db, task.id, { guard: err, changed_files: 0, needs_human: 1 }); } catch (e2) {}
+    log('审计失败，禁止自动验收: ' + err.error);
+    return { error: err.error, hard: [], truncated: true };
   }
 }
 
@@ -417,12 +431,12 @@ function relevantOnly(msgs) {
   const mine = new Set(
     S.listTasks(db, { owner: AGENT }).map(function (t) { return t.id; })
   );
-  return routeMessages(msgs, {
+  return filterLeadWake(routeMessages(msgs, {
     agent: AGENT,
     isLead: IS_LEAD,
     mine: mine,
     getTask: function (id) { return S.getTask(db, id); },
-  });
+  }), policy, IS_LEAD);
 }
 
 function autoAcceptReviews(msgs) {
@@ -480,55 +494,89 @@ async function oneRound(roundNo) {
   const task = pickTask();
   if (task) {
     const ws = S.workspaceFor(db, task.project, AGENT, task.id);
-    const prompt = buildTaskPrompt(task, ws);
+    let prompt = buildTaskPrompt(task, ws);
     log('第 ' + roundNo + ' 轮：拿到任务 ' + task.id + ' -> ' + ws.cwd);
     if (DRY) {
       console.log('--- 将要执行 ---');
-      console.log(RUNNER.cmd + ' ' + runnerArgs('<PROMPT>').join(' '));
+      console.log(RUNNER.cmd + ' ' + TASK_ENGINE.planArgs({ grant_id: 'dry-run', roots: [path.resolve(ws.cwd)].concat(extraDirsOf(task).map(d => path.resolve(ws.root || ws.cwd, d))), redline: task.redline ? JSON.parse(task.redline) : [] }, '<PROMPT>', { task, profile: DSH_PROFILE, patch: DSH_PATCH, }).join(' '));
       console.log('--- 完整 prompt ---');
       console.log(prompt);
       return 'dry';
     }
     const cl = S.claim(db, AGENT, task.id);
     if (!cl.ok) { skipped.add(task.id); log('认领失败: ' + cl.reason + ' ' + cl.message); return 'retry'; }
-    log('已认领 ' + task.id);
-
-    if (!fs.existsSync(ws.cwd)) { try { fs.mkdirSync(ws.cwd, { recursive: true }); } catch (e) {} }
-
-    // 快照只在拿到任务后做：待机轮次不碰文件系统，也不产生任何模型调用
-    let before = null;
-    let beforeErr = null;
-    try { before = snapshotAll(task, ws); } catch (e) { beforeErr = String((e && e.message) || e); log('运行前快照失败: ' + beforeErr); }
-
-    const leaseTimer = setInterval(function () { try { S.renewLease(db, AGENT, task.id, 15); } catch (e) {} }, 2 * 60 * 1000);
-    let r;
-    const dirs = task.extra_dirs ? JSON.parse(task.extra_dirs) : [];
-    try { r = await runAgent(prompt, ws.cwd, dirs); } finally { clearInterval(leaseTimer); S.renewLease(db, AGENT, task.id, 15); }
+    const fail = message => { S.updateTask(db, AGENT, task.id, 'failed', message); log(message); };
+    for (const name of ['issueExecutionGrant', 'getExecutionGrant', 'extendExecutionGrant', 'revokeExecutionGrant', 'deferExecutionTask']) {
+      if (typeof S[name] !== 'function') { fail('execution_grant_api_unavailable: 缺少 ' + name); return 'worked'; }
+    }
+    const issued = S.issueExecutionGrant(db, task.id, AGENT, { task_version: cl.task && cl.task.version });
+    if (!issued.ok) { fail('签发执行授权失败: ' + issued.reason + ' ' + (issued.message || '')); return 'worked'; }
+    const grant = issued.grant;
+    const frozenSpec = task.verify_id ? validateFrozenVerifier(task, S.resolveProjectDir(task.project)) : null;
+    if (frozenSpec && !frozenSpec.ok) { fail('验证器配置被篡改或无效: ' + frozenSpec.reason + ' ' + frozenSpec.message); return 'worked'; }
+    Object.assign(task, cl.task || {});
+    ws.cwd = grant.roots[0];
+    prompt = buildTaskPrompt(task, ws);
+    const admitted = CodexEngine.admitTask(S, db, task, AGENT, TASK_ENGINE, grant);
+    if (!admitted.ok) { log(admitted.message); if (admitted.deferred !== true) fail(admitted.message); return 'worked'; }
+    if (!fs.existsSync(ws.cwd)) fs.mkdirSync(ws.cwd, { recursive: true });
+    let before;
+    try { before = snapshotAll(task, ws, grant); }
+    catch (error) { fail('运行前快照失败: ' + String(error)); return 'worked'; }
+    const beforeErr = null;
+    const controller = new AbortController();
+    let leaseFailure = null;
+    const renew = () => {
+      try {
+        const renewed = S.renewLease(db, AGENT, task.id, 15);
+        if (!renewed || renewed.ok === false) throw new Error('任务租约续期失败');
+        const extended = S.extendExecutionGrant(db, task.id, AGENT, 15 * 60 * 1000);
+        if (!extended.ok) throw new Error('执行授权续期失败: ' + (extended.reason || ''));
+      } catch (error) { leaseFailure = String(error); controller.abort(); }
+    };
+    const valid = S.getExecutionGrant(db, task.id, AGENT);
+    if (!valid || valid.grant_id !== grant.grant_id) { fail('execution_grant_invalid: 启动前授权已失效'); return 'worked'; }
+    const leaseTimer = setInterval(renew, 2 * 60 * 1000);
+    let r, egress = null;
+    try {
+      if (FAKE) r = { code: 0, out: '（fake 模式，未调用引擎）', tokens: { in: 0, out: 0 } };
+      else {
+        // 只有执行端声明了网络强制隔离才会真的拿到代理地址；否则这里是 null，任务早已转待批。
+        egress = typeof startTaskEgress === 'function' ? await startTaskEgress(task, TASK_ENGINE, policy, recordEgress) : null;
+        r = await TASK_ENGINE.spawnTask(grant, prompt, { runner: RUNNER, signal: controller.signal, task, env: egress ? egress.env : undefined, profile: DSH_PROFILE, patch: DSH_PATCH, permissionMode: leadPermissions(policy, IS_LEAD).restricted ? 'plan' : 'default', });
+        r.tokens = extractTokens(r.out);
+      }
+    } catch (error) { r = { code: -1, out: '', err: String(error), tokens: { in: 0, out: 0 } }; }
+    finally { clearInterval(leaseTimer); renew(); if (egress && typeof egress.close === 'function') { try { egress.close(); } catch (error) {} } }
+    if (leaseFailure) { fail('执行期间续租失败，已终止子进程: ' + leaseFailure); return 'worked'; }
 
     S.recordUsage(db, AGENT, task.id, 'execute', r.tokens.in, r.tokens.out);
     const logFile = saveRawLog(task.id, r.out || r.err);
-    const note = bounded(summarize(r.out || r.err) || '(无输出)') + (logFile ? '\n（原始日志: bus/logs/' + logFile + '）' : '');
+    const note = bounded(summarize(r.out || r.err) || '(无输出)') + (logFile ? '\n（原始日志: bus/logs/' + logFile + '）' : '') +
+      (egress ? '\n联网经本地审计代理 ' + egress.url + '（仅审计，无法强制隔离）' : '');
 
-    const g = auditRun(task, ws, before, beforeErr);
+    const g = auditRun(task, ws, before, beforeErr, grant);
     if (g && g.hard.length) { blockOnGuard(task, g); return 'worked'; }
     if (r.code === 0) {
       let reviewNote = note;
-      if (task.verify_cmd) {
-        const v = await runVerify(task.verify_cmd);
-        if (!v.ok) {
+      if (task.verify_id) {
+        if (!frozenSpec || !frozenSpec.ok) {
           S.updateTask(db, AGENT, task.id, 'in_progress');
-          S.updateTask(db, AGENT, task.id, 'failed', '验收命令未通过: ' + task.verify_cmd + '\n' + bounded(v.out || '(无输出)') + '\n' + note);
-          log('任务 ' + task.id + ' 验收命令失败，已判 failed');
+          S.updateTask(db, AGENT, task.id, 'failed', '冻结验证器不可用，拒绝执行: ' + task.verify_id + '\n' + note);
           return 'worked';
         }
-        reviewNote = '验收通过: ' + task.verify_cmd + '\n' + bounded(v.out || '(无输出)') + '\n' + note;
-        log('验收命令通过: ' + task.verify_cmd);
+        const v = await runVerifier(frozenSpec.spec, { db, task_id: task.id, verify_id: task.verify_id, verify_spec_hash: task.verify_spec_hash, projectRoot: S.resolveProjectDir(task.project) });
+        if (!v.ok) {
+          S.updateTask(db, AGENT, task.id, 'in_progress');
+          S.updateTask(db, AGENT, task.id, 'failed', '机械验收失败: 项目验证器 ' + task.verify_id + ' (' + (v.reason || v.exit_code) + ')\n' + bounded(v.stdout_tail + '\n' + v.stderr_tail) + (v.log_path ? '\n验证日志: ' + v.log_path : '') + '\n' + note);
+          log('任务 ' + task.id + ' 项目验证器失败，已判 failed'); return 'worked';
+        }
+        reviewNote = '机械验收通过: 项目验证器 ' + task.verify_id + ' (exit ' + v.exit_code + ', ' + v.duration_ms + 'ms)\n' + bounded(v.stdout_tail + '\n' + v.stderr_tail) + (v.log_path ? '\n验证日志: ' + v.log_path : '') + '\n' + note;
+        log('项目验证器通过: ' + task.verify_id);
       }
-      const pin = S.updateTask(db, AGENT, task.id, 'in_progress');
-      const prev = S.updateTask(db, AGENT, task.id, 'review', reviewNote);
-      if (prev.ok) log('任务 ' + task.id + ' 完成，已提交验收');
-      else log('回报失败: ' + prev.reason + ' ' + prev.message + '（任务可能已被取消或改派）');
-      if (!pin.ok) log('状态推进异常: ' + pin.reason);
+      S.updateTask(db, AGENT, task.id, 'in_progress');
+      S.updateTask(db, AGENT, task.id, 'review', reviewNote);
+      log('任务 ' + task.id + ' 完成，已提交验收');
     } else {
       S.updateTask(db, AGENT, task.id, 'failed', ENGINE + ' 退出码 ' + r.code + '\n' + note);
       log('任务 ' + task.id + ' 失败，退出码 ' + r.code);

@@ -115,7 +115,7 @@ export function audit(ctx) {
   const changed = d.added.concat(d.modified, d.deleted);
   const grants = mergeKinds(task.grants);
   const base = ws.cwd || ws.root || '';
-  const extra = listOf(task.extra_dirs);
+  const extra = ctx && ctx.grant ? ctx.grant.roots.slice(1) : listOf(task.extra_dirs);
   const hard = [];
   const soft = [];
   const touched = d.added.concat(d.modified);
@@ -147,4 +147,23 @@ export function audit(ctx) {
   }
 
   return { ok: hard.length === 0, hard: hard, soft: soft, changed_files: d.count, changed: changed };
+}
+
+export function snapshotGrant(grant) {
+  if (!grant || !Array.isArray(grant.roots) || !grant.roots.length) throw new Error('execution_grant_invalid: 快照缺少授权根');
+  const files = {};
+  let truncated = false, scanned = 0;
+  for (const root of grant.roots) {
+    const current = snapshot(root);
+    truncated ||= current.truncated;
+    scanned += current.scanned;
+    for (const [relative, value] of Object.entries(current.files)) files[path.resolve(root, relative)] = value;
+  }
+  return { files, truncated, scanned, grant_id: grant.grant_id, task_version: grant.task_version };
+}
+
+export function recordGrantAudit(db, task, owner, grant, before, after) {
+  const detail = { grant_id: grant.grant_id, task_version: grant.task_version, truncated: Boolean(before?.truncated || after?.truncated) };
+  db.prepare('INSERT INTO guard_events(task_id,agent,kind,detail,action,actor,ts) VALUES(?,?,?,?,?,?,?)').run(task.id, owner, 'execution:snapshot', JSON.stringify(detail), detail.truncated ? 'needs_human' : 'audit', owner, new Date().toISOString());
+  return detail;
 }

@@ -28,12 +28,18 @@
     "dispatch_enabled": true,
     "max_dispatch_depth": 2,
     "max_chain_len": 3,
-    "rate_per_agent_per_hour": 20
+    "rate_per_agent_per_hour": 20,
+    "require_credentials": false
+  },
+  "network": {
+    "default": "deny",
+    "local_services": [
+      { "port": 7400, "purpose": "AgentBus 本地看板" }
+    ]
   },
   "economics": {
     "lead_may_read_files": false,
     "lead_may_write_code": false,
-    "lead_plans_once": true,
     "lead_wake_on": [
       "contract_conflict",
       "retry_exceeded",

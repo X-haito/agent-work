@@ -16,7 +16,7 @@ const actualRegistry = path.join(BUS_DIR, 'projects.json');
 const actualSnapshot = fs.readFileSync(actualRegistry, 'utf8');
 try {
   fs.mkdirSync(bus);
-  for (const file of ['store.mjs', 'schema.sql', 'redline.mjs']) {
+  for (const file of ['store.mjs', 'schema.sql', 'redline.mjs', 'migrations.mjs', 'execution-grant.mjs', 'verifier.mjs']) {
     fs.copyFileSync(path.join(BUS_DIR, file), path.join(bus, file));
   }
   const S = await import(pathToFileURL(path.join(bus, 'store.mjs')).href);

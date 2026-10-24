@@ -6,6 +6,10 @@ import readline from 'node:readline';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as S from './store.mjs';
+import { validateTaskFields } from './console-server.mjs';
+import { validateNetworkGrants } from './admin-config.mjs';
+import { KINDS } from './redline.mjs';
+import * as Creds from './auth.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -17,12 +21,28 @@ function argOf(name, def) {
   return def;
 }
 
-const AGENT = argOf('agent', process.env.AGENT_BUS_ID || 'unknown');
+// 身份以凭据为准：--agent 只是提示。human 永不签发凭据，因此 --agent human 拿不到 Human 权限。
+const TOKEN = process.env.AGENT_BUS_TOKEN || argOf('token', '');
+let AGENT = argOf('agent', process.env.AGENT_BUS_ID || 'unknown');
 const DB = S.openDb(argOf('db', S.DEFAULT_DB));
 let policy = S.loadPolicy();
 function freshPolicy() { try { policy = S.loadPolicy(); } catch (e) {} return policy; }
 
-S.heartbeat(DB, AGENT, 'idle');
+let AUTH = { ok: false, reason: 'auth_required', enforced: false, method: 'none' };
+function resolveIdentity() {
+  const enforced = !!(policy && policy.global && policy.global.require_credentials === true);
+  if (TOKEN) {
+    const verified = Creds.verifyCredential(DB, TOKEN);
+    if (verified.ok) { AGENT = verified.agent; AUTH = { ok: true, agent: verified.agent, enforced: enforced, method: 'token' }; return; }
+    AUTH = { ok: false, reason: verified.reason, enforced: enforced, method: 'token' };
+    return;
+  }
+  AUTH = enforced
+    ? { ok: false, reason: 'auth_required', enforced: true, method: 'none' }
+    : { ok: true, agent: AGENT, enforced: false, method: 'legacy' };
+}
+resolveIdentity();
+if (AUTH.ok) S.heartbeat(DB, AGENT, 'idle');
 
 function textResult(obj, isError) {
   return { content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }], isError: !!isError };
@@ -53,6 +73,10 @@ function cardFields(row) {
   const guard = parseJson(row && row.guard, null);
   const changed = Number(row && row.changed_files);
   return {
+    verify_cmd: (row && row.verify_cmd) || '',
+    verify_id: (row && row.verify_id) || null,
+    verify_spec_hash: (row && row.verify_spec_hash) || null,
+    extra_dirs: parseJson(row && row.extra_dirs, []),
     redline: Array.isArray(redline) ? redline.map(String) : [],
     grants: Array.isArray(grants) ? grants.map(String) : [],
     guard: guard && typeof guard === 'object' ? guard : null,
@@ -157,17 +181,30 @@ const TOOLS = [
       properties: {
         to: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, project: { type: 'string' },
         write_scope: { type: 'array', items: { type: 'string' } },
-        grants: { type: 'array', items: { type: 'string' } },
+        grants: { type: 'array', maxItems: 5, items: { type: 'string', maxLength: 100, enum: KINDS } },
+        verify_id: { type: 'string', maxLength: 100, pattern: '^[a-z0-9._-]+$' },
+        verify_cmd: { type: 'string', maxLength: 1000 },
+        extra_dirs: { type: 'array', maxItems: 20, items: { type: 'string', maxLength: 500 } },
+        network_grants: { type: 'array', maxItems: 8, items: { type: 'object', properties: { protocol: { type: 'string', enum: ['http', 'https'] }, host: { type: 'string', maxLength: 253 }, ports: { type: 'array', maxItems: 16, items: { type: 'number' } }, purpose: { type: 'string', maxLength: 200 } }, required: ['protocol', 'host', 'ports', 'purpose'] } },
         cost_class: { type: 'string' }, max_subagents: { type: 'number' }, depth: { type: 'number' },
       },
       required: ['to', 'title'],
     },
     handler: function (a) {
+      Object.assign(a, validateTaskFields(a));
       // grants 是本次派发放宽红线的白名单（kind 列表），可选；去掉它仍是旧的派发语义。
       const d = Object.assign({}, a);
       if (Array.isArray(d.grants)) d.grants = d.grants.map(function (g) { return String(g).trim(); }).filter(Boolean);
       else delete d.grants;
-      return S.dispatch(DB, policy, AGENT, d);
+      if (Object.prototype.hasOwnProperty.call(d, 'verify_cmd') && AGENT !== 'human') return { ok: false, reason: 'legacy_verify_cmd_forbidden', message: 'Agent 不得提交自由 verify_cmd，请使用项目已登记的 verify_id' };
+      if (Object.prototype.hasOwnProperty.call(d, 'verify_cmd') && d.verify_cmd && !d.verify_id) d.status = 'proposed';
+      if (Object.prototype.hasOwnProperty.call(d, 'network_grants')) {
+        d.network_grants = validateNetworkGrants(d.network_grants);
+        if (d.network_grants.length) d.status = 'proposed'; // 联网必须 Human 批准
+      }
+      const result = S.dispatch(DB, policy, AGENT, d);
+      if (result.task) result.task = { ...result.task, ...cardFields(result.task), extra_dirs: parseJson(result.task.extra_dirs, []), network_grants: parseJson(result.task.network_grants, []) };
+      return result;
     },
   },
   {
@@ -242,6 +279,12 @@ async function handle(msg) {
   if (method === 'tools/call') {
     const p = msg.params || {};
     freshPolicy();
+    resolveIdentity();
+    if (!AUTH.ok) {
+      return { jsonrpc: '2.0', id: id, result: textResult({
+        ok: false, reason: AUTH.reason, message: 'AgentBus 需要有效凭据（AGENT_BUS_TOKEN）；human 不签发 MCP 凭据',
+      }, true) };
+    }
     const tool = byName(p.name);
     if (!tool) return { jsonrpc: '2.0', id: id, error: { code: -32601, message: 'unknown tool: ' + p.name } };
     try {

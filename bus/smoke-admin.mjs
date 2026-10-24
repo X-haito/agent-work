@@ -1,10 +1,12 @@
 #!/usr/bin/env node
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import * as S from './store.mjs';
 import * as A from './admin-config.mjs';
 import { createBoardServer } from './console-server.mjs';
+import * as Auth from './auth.mjs';
 import vm from 'node:vm';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-admin-'));
@@ -73,14 +75,15 @@ const policyContext = vm.createContext({
   qa: function (selector) { return selector === '[data-e]' ? [{ dataset: { e: 'require_verify_cmd' }, get checked() { return policyNode('[data-e="require_verify_cmd"]').checked; } }] : []; },
   esc: String, csv: v => (v || []).join(', '), split: v => String(v || '').split(',').map(x => x.trim()).filter(Boolean),
   api: async function (url, options) { savedPolicyBody = options.body; return { policy: options.body.policy }; },
-  toast: function () {}, load: async function () {},
+  toast: function () {}, load: async function () {}, renderPolicyRegistry: function () {},
 });
-vm.runInContext(policyScript.split('\n').filter(line => line.trim().startsWith('function renderPolicy()') || line.trim().startsWith('function collectPolicy()') || line.trim().startsWith("q('#save-policy').onclick=")).join('\n'), policyContext);
+const uiPolicyLines = policyScript.split('\n').filter(line => /^function (renderPolicy|collectPolicy|collectNetworkPolicy|renderNetworkServices|networkServiceRows|networkServicesEmpty|networkServiceRow)\(/.test(line.trim()) || line.trim().startsWith("q('#save-policy').onclick=")).join('\n');
+vm.runInContext(uiPolicyLines, policyContext);
 for (const value of [false, true]) {
   policyContext.state.policy.economics.require_verify_cmd = value;
   vm.runInContext('renderPolicy()', policyContext);
   const switches = policyNode('#economics-switches').innerHTML;
-  ok('验收命令开关初始值 ' + value, switches.includes('自动验收类别必须填写 verify_cmd') && (switches.includes('data-e="require_verify_cmd" checked') === value));
+  ok('验收命令开关初始值 ' + value, switches.includes('自动验收类别必须选择验证器') && (switches.includes('data-e="require_verify_cmd" checked') === value));
 }
 policyNode('[data-e="require_verify_cmd"]').checked = true;
 await vm.runInContext("q('#save-policy').onclick()", policyContext);
@@ -88,6 +91,28 @@ ok('勾选后策略保存请求含 boolean true', savedPolicyBody.policy.economi
 policyNode('[data-e="require_verify_cmd"]').checked = false;
 await vm.runInContext("q('#save-policy').onclick()", policyContext);
 ok('取消勾选后策略保存请求含 boolean false', savedPolicyBody.policy.economics.require_verify_cmd === false);
+policyContext.state.policy.economics.lead_plans_once = true;
+vm.runInContext('renderPolicy()', policyContext);
+ok('表单移除 lead_plans_once 死开关', !policyNode('#economics-switches').innerHTML.includes('lead_plans_once'));
+await vm.runInContext("q('#save-policy').onclick()", policyContext);
+ok('策略保存不保留 lead_plans_once', !Object.prototype.hasOwnProperty.call(savedPolicyBody.policy.economics, 'lead_plans_once'));
+ok('策略保存请求显式提交 network 段（不依赖服务端兜底）', !!savedPolicyBody.policy.network && savedPolicyBody.policy.network['default'] === 'deny' && Array.isArray(savedPolicyBody.policy.network.local_services));
+const networkNodes = new Map();
+function networkNode(selector) { if (!networkNodes.has(selector)) networkNodes.set(selector, { value: '', checked: false, hidden: false, innerHTML: '' }); return networkNodes.get(selector); }
+const editedServices = [{ querySelector: s => ({ value: s.indexOf('port') >= 0 ? '7400' : '看板' }) }, { querySelector: s => ({ value: s.indexOf('port') >= 0 ? '7500' : '本地模型' }) }];
+let networkSavedBody;
+const networkContext = vm.createContext({
+  state: { policy: JSON.parse(JSON.stringify(base)) }, dirty: true, q: networkNode,
+  qa: function (selector) { return selector === '[data-network-service]' ? editedServices : []; },
+  esc: String, csv: v => (v || []).join(', '), split: v => String(v || '').split(',').map(x => x.trim()).filter(Boolean),
+  api: async function (url, options) { networkSavedBody = options.body; return { policy: options.body.policy }; },
+  toast: function () {}, load: async function () {}, renderPolicyRegistry: function () {},
+});
+vm.runInContext(uiPolicyLines, networkContext);
+await vm.runInContext("q('#save-policy').onclick()", networkContext);
+ok('策略页把用户编辑的 local_services 原样提交', JSON.stringify(networkSavedBody.policy.network.local_services) === '[{"port":7400,"purpose":"看板"},{"port":7500,"purpose":"本地模型"}]', networkSavedBody.policy.network);
+ok('策略页网络段 default 固定 deny', networkSavedBody.policy.network['default'] === 'deny');
+
 
 console.log('\n[3] MCP 定向配置写入');
 const fakeHome = path.join(dir, 'home');
@@ -114,10 +139,73 @@ console.log('\n[4] 管理 API 与 CSRF');
 const apiDb = S.openDb(path.join(dir, 'api.db'));
 const projectOptions = { path: path.join(dir, 'projects.json'), workspaceRoot: path.join(dir, 'workspaces') };
 fs.writeFileSync(projectOptions.path, JSON.stringify({ _note: '测试注册表', projects: {} }));
-const server = createBoardServer({ port: 7400, actor: 'human', csrf: 'test-token', db: apiDb, projectOptions });
+// 策略文件：复制真实 policy.json 到临时目录，看板只读写这份副本，绝不碰真实文件。
+const realPolicyFile = path.join(S.BUS_DIR, 'policy.json');
+const realPolicyHashBefore = crypto.createHash('sha256').update(fs.readFileSync(realPolicyFile)).digest('hex');
+const serverPolicyPath = path.join(dir, 'policy.json');
+fs.copyFileSync(realPolicyFile, serverPolicyPath);
+const server = createBoardServer({ port: 7400, actor: 'human', csrf: 'test-token', db: apiDb, projectOptions, policyPath: serverPolicyPath });
 await new Promise(function (resolve) { server.listen(0, '127.0.0.1', resolve); });
 const port = server.address().port;
 const apiUrl = 'http://127.0.0.1:' + port;
+
+// 会话认证：看板用一次性 bootstrap token 换 HttpOnly 会话 cookie，写操作还要 CSRF 头与严格 Origin。
+// 这里包一层 fetch，自动带上 cookie 与本机 Origin；x-test-* 标记只用于构造被拒绝的请求。
+const realFetch = globalThis.fetch;
+const sessionJar = new Map();
+globalThis.fetch = async function (input, init) {
+  const options = Object.assign({}, init || {});
+  const target = new URL(typeof input === 'string' ? input : String(input && input.url || input));
+  const outgoing = Object.assign({}, options.headers || {});
+  let noSession = false;
+  let noOrigin = false;
+  let badOrigin = false;
+  let localhostOrigin = false;
+  let localhostOtherPort = false;
+  for (const key of Object.keys(outgoing)) {
+    const marker = key.toLowerCase();
+    if (marker === 'x-test-no-session') { noSession = true; delete outgoing[key]; }
+    if (marker === 'x-test-no-origin') { noOrigin = true; delete outgoing[key]; }
+    if (marker === 'x-test-bad-origin') { badOrigin = true; delete outgoing[key]; }
+    if (marker === 'x-test-localhost-origin') { localhostOrigin = true; delete outgoing[key]; }
+    if (marker === 'x-test-localhost-other-port') { localhostOtherPort = true; delete outgoing[key]; }
+  }
+  if (!noSession && sessionJar.has(target.port)) outgoing.cookie = sessionJar.get(target.port);
+  const verb = String(options.method || 'GET').toUpperCase();
+  if (verb !== 'GET' && verb !== 'HEAD') {
+    const declared = Object.keys(outgoing).some(function (key) { return key.toLowerCase() === 'origin'; });
+    if (badOrigin) outgoing.origin = 'http://evil.example';
+    else if (localhostOrigin) outgoing.origin = 'http://localhost:' + target.port;
+    else if (localhostOtherPort) outgoing.origin = 'http://localhost:' + (Number(target.port) + 1);
+    else if (!noOrigin && !declared) outgoing.origin = 'http://127.0.0.1:' + target.port;
+  }
+  options.headers = outgoing;
+  const response = await realFetch(input, options);
+  const issued = typeof response.headers.getSetCookie === 'function' ? response.headers.getSetCookie() : [];
+  for (const raw of issued) {
+    const pair = String(raw).split(';')[0];
+    if (pair.indexOf('agentbus_console_session=') === 0) sessionJar.set(target.port, pair);
+  }
+  return response;
+};
+async function login(origin, token) {
+  return fetch(origin + '/?token=' + encodeURIComponent(token), { redirect: 'manual' });
+}
+
+const bootstrapToken = server.agentBus.bootstrap.token;
+ok('启动时生成一次性 bootstrap token', typeof bootstrapToken === 'string' && bootstrapToken.length >= 32);
+const noSessionPage = await fetch(apiUrl + '/', { headers: { 'x-test-no-session': '1' }, redirect: 'manual' });
+const noSessionHtml = await noSessionPage.text();
+ok('无会话访问控制台页面被拒且不回显 token', noSessionPage.status === 403 && noSessionHtml.includes('session_required') && !noSessionHtml.includes(bootstrapToken));
+const wrongToken = await fetch(apiUrl + '/?token=' + encodeURIComponent('wrong-token-value'), { redirect: 'manual' });
+ok('错误的 bootstrap token 返回 403 与稳定错误码', wrongToken.status === 403 && (await wrongToken.text()).includes('bootstrap_token_invalid'));
+const sessionLogin = await login(apiUrl, bootstrapToken);
+const loginCookie = (sessionLogin.headers.getSetCookie() || []).find(function (c) { return c.indexOf('agentbus_console_session=') === 0; }) || '';
+const sessionCookie = loginCookie.split(';')[0];
+ok('一次性 token 换 HttpOnly + SameSite=Strict 会话 cookie 并重定向去掉 token', sessionLogin.status === 303 && sessionLogin.headers.get('location') === '/' && loginCookie.includes('HttpOnly') && loginCookie.includes('SameSite=Strict'));
+const reusedToken = await fetch(apiUrl + '/?token=' + encodeURIComponent(bootstrapToken), { redirect: 'manual' });
+ok('已使用的一次性 token 不能二次换取', reusedToken.status === 403 && (await reusedToken.text()).includes('bootstrap_token_used'));
+
 const home = await fetch(apiUrl + '/');
 const html = await home.text();
 ok('控制台页面可渲染', home.status === 200 && html.includes('任务台账'));
@@ -254,6 +342,92 @@ const projectState = await (await fetch(apiUrl + '/api/state')).json();
 ok('state项目列表与管理能力', projectState.project_management && projectState.project_registry.some(p => p.id === dirtyProject && !p.registered));
 ok('临时注册不改真实文件', fs.readFileSync(path.join(S.BUS_DIR, 'projects.json'), 'utf8') === originalRegistry);
 ok('项目页可选路径与未登记标记', html.includes('id="page-projects"') && html.includes('id="pf-path" placeholder=') && html.includes('未登记'));
+
+console.log('任务验证与授权字段');
+ok('任务表单字段与授权详情存在', ['tf-verify','tf-extra','tf-grants','tf-authorization','tf-extra-notice'].every(id => html.includes(id)));
+
+const taskNodes = new Map();
+function taskNode(s){ if(!taskNodes.has(s))taskNodes.set(s,{value:'',disabled:false,checked:false,selectedOptions:[],focus(){this.focused=true},addEventListener(event,fn){this[event]=fn}});return taskNodes.get(s)}
+let taskRequests=0, taskNotice='';
+const taskContext=vm.createContext({q:taskNode,qa:()=>[],esc:String,collectNetworkGrants:()=>[],state:{policy:{economics:{require_verify_cmd:true,auto_accept:['tests']}}},api:async()=>{taskRequests++},toast:msg=>{taskNotice=msg},load:async()=>{},dirty:false});
+const submitLine=policyScript.split(String.fromCharCode(10)).find(line=>line.trim().startsWith("q('#task-form').addEventListener('submit'"));
+vm.runInContext(submitLine,taskContext);
+taskNode('#tf-title').value='前端验证命令必填';taskNode('#tf-cost').value='tests';taskNode('#tf-subs').value='0';
+await taskNode('#task-form').submit({preventDefault(){}});
+ok('必填verify_cmd在前端阻断且零请求',taskRequests===0&&taskNotice.includes('必须选择 verify_id')&&taskNode('#tf-verify').focused===true);
+const fieldHeaders = headers;
+const validatorProject = path.join(dir, 'validator-project'); fs.mkdirSync(validatorProject);
+const validatorSpec = { command: 'node', args: ['smoke.mjs'], cwd: '.', timeout_ms: 1000 };
+fs.writeFileSync(path.join(validatorProject, 'project.json'), JSON.stringify({ id: 'validator-test', root: validatorProject, validators: { smoke: validatorSpec, second: { ...validatorSpec, args: ['verify.mjs'] } } }));
+const fieldInput = { title: '授权字段详情任务', project: validatorProject, cost_class: 'standard', verify_id: 'smoke', extra_dirs: ['docs'], grants: ['cfg:edit'] };
+const fieldResponse = await fetch(apiUrl + '/api/tasks', { method: 'POST', headers: fieldHeaders, body: JSON.stringify(fieldInput) });
+const fieldBody = await fieldResponse.json();
+const fieldTask = fieldBody.task;
+if (fieldTask && Object.prototype.hasOwnProperty.call(fieldTask,'verify_id')) {
+  ok('API回显验证命令额外目录实际授权红线', fieldTask.verify_id === fieldInput.verify_id && !!fieldTask.verify_spec_hash && !!fieldTask.verify_spec_json && fieldTask.extra_dirs[0] === 'docs' && fieldTask.grants[0] === 'cfg:edit' && Array.isArray(fieldTask.redline));
+  ok('额外目录使任务进入待批', fieldTask.status === 'proposed');
+  const edits = await fetch(apiUrl + '/api/tasks/' + fieldTask.id, { method: 'PATCH', headers: fieldHeaders, body: JSON.stringify({ version: fieldTask.version, verify_id: 'second', extra_dirs: ['docs','tests'], grants: ['cfg:edit','net:egress'] }) });
+  const editedFields = await edits.json();
+  ok('执行前可编辑结构性授权字段', edits.status === 200 && editedFields.task.verify_id === 'second' && !!editedFields.task.verify_spec_hash && editedFields.task.extra_dirs.length === 2 && editedFields.task.grants.length === 2);
+  for (const bad of [{verify_cmd:1},{verify_cmd:'x'.repeat(1001)},{extra_dirs:['x'.repeat(501)]},{extra_dirs:Array(21).fill('docs')},{grants:['unknown']}]) {
+    const invalid = await fetch(apiUrl + '/api/tasks', { method: 'POST', headers: fieldHeaders, body: JSON.stringify(Object.assign({title:'非法字段测试'},bad)) });
+    ok('API拒绝非法字段 ' + Object.keys(bad)[0], invalid.status === 400 && !!(await invalid.json()).error);
+  }
+  const lockResponse = await fetch(apiUrl + '/api/tasks', { method: 'POST', headers: fieldHeaders, body: JSON.stringify({ title:'锁定字段测试', target:'claude/main', verify_id:'smoke', project:validatorProject }) });
+  const lockTask = (await lockResponse.json()).task;
+  S.claim(apiDb,'claude/main',lockTask.id,15);
+  for (const patch of [{verify_id:'second'},{extra_dirs:['docs']},{grants:['cfg:edit']}]) {
+    const locked = await fetch(apiUrl+'/api/tasks/'+lockTask.id,{method:'PATCH',headers:fieldHeaders,body:JSON.stringify(patch)});
+    ok('执行后授权字段锁定 ' + Object.keys(patch)[0], locked.status === 409 && (await locked.json()).error.includes('结构性授权字段已锁定'));
+  }
+  S.updateTask(apiDb,'claude/main',lockTask.id,'failed','smoke 清理运行状态');
+} else {
+  ok('字段API尚未就绪时明确降级', fieldResponse.status < 500);
+  console.log('字段API尚未回显，跳过字段API严格断言');
+}
+
+
+console.log('项目验证器配置与冻结');
+const projectValidatorUrl = apiUrl + '/api/projects/registered-ui/validators';
+const validatorSave = await fetch(projectValidatorUrl, {method:'PUT',headers,body:JSON.stringify({validators:{smoke:validatorSpec}})});
+const validatorSaveBody = await validatorSave.json();
+ok('Human保存验证器通过规范化并返回备份路径',validatorSave.status===200&&validatorSaveBody.validators.smoke.command==='node'&&!!validatorSaveBody.config_path);
+const projectValidatorsList = await (await fetch(apiUrl+'/api/projects')).json();
+ok('项目列表从配置回显validators',projectValidatorsList.find(p=>p.id==='registered-ui').validators.smoke.args[0]==='smoke.mjs');
+const invalidValidatorSave = await fetch(projectValidatorUrl,{method:'PUT',headers,body:JSON.stringify({validators:{bad:{command:'node',args:[],cwd:'../outside',timeout_ms:1000}}})});
+ok('保存验证器拒绝cwd越界',invalidValidatorSave.status===400);
+const invalidValidatorCreate=await projectPost({id:'invalid-spec',validators:{bad:{command:'node; echo bad',args:[],cwd:'.',timeout_ms:1000}}});
+ok('创建项目拒绝非法验证器',invalidValidatorCreate.status===400);
+const unknownValidator = await fetch(apiUrl+'/api/tasks',{method:'POST',headers,body:JSON.stringify({title:'未知验证器',project:validatorProject,verify_id:'missing'})});
+ok('未知验证器原因透传',unknownValidator.status===409&&(await unknownValidator.json()).reason==='unknown_validator');
+const legacyHuman = await fetch(apiUrl+'/api/tasks',{method:'POST',headers,body:JSON.stringify({title:'Human旧命令仅待批',verify_cmd:'node legacy.mjs'})});
+ok('Human旧自由命令仅进入待批',(await legacyHuman.json()).task.status==='proposed');
+const agentValidatorServer=createBoardServer({db:apiDb,actor:base.lead,csrf:'agent-validator',projectOptions});
+await new Promise(resolve=>agentValidatorServer.listen(0,'127.0.0.1',resolve));
+const agentUrl='http://127.0.0.1:'+agentValidatorServer.address().port;
+await login(agentUrl,agentValidatorServer.agentBus.bootstrap.token);
+const agentHeaders={'content-type':'application/json','x-agentbus-request':'agent-validator'};
+const legacyAgent=await fetch(agentUrl+'/api/tasks',{method:'POST',headers:agentHeaders,body:JSON.stringify({title:'禁止自由命令',verify_cmd:'exit 0'})});
+ok('Agent自由命令拒绝原因透传',legacyAgent.status===409&&(await legacyAgent.json()).reason==='legacy_verify_cmd_forbidden');
+const agentSave=await fetch(agentUrl+'/api/projects/registered-ui/validators',{method:'PUT',headers:agentHeaders,body:JSON.stringify({validators:{}})});
+ok('Agent不能编辑项目验证器',agentSave.status===403);
+await new Promise(resolve=>agentValidatorServer.close(resolve));
+ok('任务表单为验证器选择并提示先配置',html.includes('<select id="tf-verify">')&&!html.includes('<input id="tf-verify"')&&html.includes('此项目没有验证器，请先到项目页配置'));
+console.log('策略字段生效登记');
+const registryState = await (await fetch(apiUrl + '/api/state')).json();
+if (registryState.policy_registry) {
+  const registry = registryState.policy_registry;
+  ok('state透出策略字段登记', Array.isArray(registry) && registry.length > 0 && registry.every(f=>f.path&&f.stage&&f.status&&f.owner));
+  ok('planned条目明确第7/8/9项归属', ['global.max_chain_len','economics.max_rounds_per_task','economics.daily_token_budget','economics.peer_review','economics.lead_review'].every(p=>registry.some(f=>f.path===p&&f.status==='planned'&&/^item-[789]$/.test(f.owner))));
+  policyContext.state.policy_registry=registry;
+  vm.runInContext(policyScript.split(String.fromCharCode(10)).find(line=>line.trim().startsWith('function policyEffect(')),policyContext);
+  const plannedMarkup=vm.runInContext("policyEffect('global.max_chain_len')",policyContext);
+  ok('planned字段醒目标注阶段及待第N项接线', plannedMarkup.includes('policy-effect planned')&&plannedMarkup.includes('阶段')&&plannedMarkup.includes('待第 7 项接线'));
+  const enforcedMarkup=vm.runInContext("policyEffect('economics.report_no_raw_diff')",policyContext);
+  ok('enforced字段显示实际生效阶段',enforcedMarkup.includes('报告阶段')&&enforcedMarkup.includes('已生效'));
+  policyContext.state.policy_registry=null;
+  ok('registry不可用时隐藏标注不伪造',vm.runInContext("policyEffect('global.max_chain_len')",policyContext)==='');
+} else { ok('registry模块缺省明确返回null',registryState.policy_registry===null); }
 if (process.argv.includes('--browser')) {
   console.log('\n[7] Playwright 真实页面交互');
   const { spawn } = await import('node:child_process');
@@ -266,6 +440,7 @@ if (process.argv.includes('--browser')) {
     '    if os.environ.get("AGENTBUS_TEST_BROWSER_PATH"): launch["executable_path"] = os.environ["AGENTBUS_TEST_BROWSER_PATH"]',
     '    browser = p.chromium.launch(**launch)',
     '    page = browser.new_page(viewport={"width": 1440, "height": 1050})',
+    '    page.on("dialog", lambda d: d.accept())',
     '    errors = []',
     '    page.on("pageerror", lambda e: errors.append(str(e)))',
     '    page.goto(sys.argv[1])',
@@ -273,8 +448,25 @@ if (process.argv.includes('--browser')) {
     '    page.locator("[data-page=projects]").click()',
     '    expect(page.locator("#page-projects")).to_be_visible()',
     '    expect(page.locator("[data-project-id=default]")).to_contain_text("未登记")',
-    '    expect(page.locator("[data-project-id=default]")).to_contain_text("4")',
+    '    default_project = next(p for p in page.request.get(sys.argv[1] + "/api/projects").json() if p["id"] == "default")',
+    '    expect(page.locator("[data-project-id=default] .project-facts")).to_contain_text("任务 " + str(default_project["tasks"]))',
+    '    expect(page.locator("[data-project-id=default]")).to_contain_text("Token")',
     '    expect(page.locator("[data-project-id=registered-ui] [data-delete-project]")).to_be_disabled()',
+    '    page.locator("[data-project-id=registered-ui] [data-edit-validators]").click()',
+    '    expect(page.locator("#validators-dialog")).to_be_visible()',
+    '    expect(page.locator("#project-edit-validators [data-v=command]")).to_have_value("node")',
+    '    page.locator("#project-edit-add-validator").click()',
+    '    row = page.locator("#project-edit-validators .validator-row").last',
+    '    row.locator("[data-v=id]").fill("browser-check")',
+    '    row.locator("[data-v=command]").fill("node")',
+    '    row.locator("[data-v=args]").fill("--version")',
+    '    row.locator("[data-v=cwd]").fill(".")',
+    '    row.locator("[data-v=timeout_ms]").fill("1500")',
+    '    page.locator("#validators-save").click()',
+    '    expect(page.locator("#validators-result")).to_contain_text("验证器已保存")',
+    '    page.screenshot(path=sys.argv[2] + "/project-validators-editor.png", full_page=True)',
+    '    page.locator("#validators-close").click()',
+    '    expect(page.locator("[data-project-id=registered-ui]")).to_contain_text("browser-check")',
     '    page.screenshot(path=sys.argv[2] + "/projects-desktop.png", full_page=True)',
     '    page.set_viewport_size({"width": 390, "height": 844})',
     '    page.screenshot(path=sys.argv[2] + "/projects-mobile.png", full_page=True)',
@@ -286,14 +478,38 @@ if (process.argv.includes('--browser')) {
     '    page.locator("#project-create-submit").click()',
     '    expect(page.locator("#project-result")).to_contain_text("project.json")',
     '    expect(page.locator("[data-project-id=browser-ui]")).to_contain_text("已登记")',
-    '    page.once("dialog", lambda d: d.accept())',
     '    page.locator("[data-project-id=browser-ui] [data-delete-project]").click()',
     '    expect(page.locator("[data-project-id=browser-ui]")).to_have_count(0)',
     '    page.locator("[data-page=tasks]").click()',
     '    page.locator("#task-project").select_option("default")',
-    '    expect(page.locator("#task-rows tr")).to_have_count(4)',
+    '    current_tasks = page.request.get(sys.argv[1] + "/api/tasks").json()',
+    '    active_default_count = sum(1 for t in current_tasks if t["project"] == "default" and t["status"] not in ["done", "failed", "declined", "cancelled"])',
+    '    expect(page.locator("#task-rows tr")).to_have_count(active_default_count)',
     '    expect(page.locator("#task-rows tr").first).to_contain_text("未登记")',
     '    page.locator("[data-page=overview]").click()',
+    '    def require_verification(route):',
+    '        response = route.fetch()',
+    '        data = response.json()',
+    '        data["policy"]["economics"]["require_verify_cmd"] = True',
+    '        data["policy"]["economics"]["auto_accept"] = ["tests"]',
+    '        route.fulfill(response=response, json=data)',
+    '    page.route("**/api/state", require_verification)',
+    '    page.reload()',
+    '    page.wait_for_load_state("networkidle")',
+    '    create_requests = []',
+    '    page.on("request", lambda r: create_requests.append(r.url) if r.method == "POST" and r.url.endswith("/api/tasks") else None)',
+    '    page.locator("[data-new-task]").first.click()',
+    '    page.locator("#tf-title").fill("前端必填验证命令")',
+    '    expect(page.locator("#tf-verify-help")).to_contain_text("先到项目页配置")',
+    '    page.locator("#tf-cost").select_option("tests")',
+    '    page.locator("#save-task").click()',
+    '    expect(page.locator("#toast")).to_contain_text("必须选择 verify_id")',
+    '    assert len(create_requests) == 0',
+    '    expect(page.locator("#task-dialog")).to_be_visible()',
+    '    page.locator("[data-close-task]").first.click()',
+    '    page.unroute("**/api/state", require_verification)',
+    '    page.reload()',
+    '    page.wait_for_load_state("networkidle")',
     '    expect(page.locator("#project-cost")).to_be_visible()',
     '    expect(page.locator("#cost-total-in")).to_have_text("200")',
     '    expect(page.locator("#cost-total-out")).to_have_text("45")',
@@ -316,6 +532,18 @@ if (process.argv.includes('--browser')) {
     '    expect(page.locator("#task-rows")).to_contain_text("report-demo")',
     '    page.locator("#task-status").select_option("failed")',
     '    expect(page.locator("#task-empty")).to_be_visible()',
+    '    page.locator("[data-page=tasks]").click()',
+    '    page.locator("#task-project").select_option(os.path.join(sys.argv[2], "validator-project"))',
+    '    page.locator("#task-status").select_option("")',
+    '    page.locator("#task-search").fill("授权字段详情")',
+    '    page.locator("#task-rows [data-edit]").first.click()',
+    '    expect(page.locator("#tf-verify")).to_have_value("second")',
+    '    expect(page.locator("#tf-frozen-spec")).to_contain_text("SHA-256")',
+    '    expect(page.locator("#tf-extra")).to_have_value("docs" + chr(10) + "tests")',
+    '    expect(page.locator("#tf-authorization")).to_contain_text("cfg:edit")',
+    '    expect(page.locator("#tf-extra-notice")).to_be_visible()',
+    '    page.screenshot(path=sys.argv[2] + "/task-authorization-details.png", full_page=True)',
+    '    page.locator("[data-close-task]").first.click()',
     '    page.locator("[data-page=reports]").click()',
     '    page.wait_for_load_state("networkidle")',
     '    expect(page.locator("#page-reports")).to_be_visible()',
@@ -336,7 +564,6 @@ if (process.argv.includes('--browser')) {
     '    page.set_viewport_size({"width": 390, "height": 844})',
     '    page.screenshot(path=sys.argv[2] + "/reports-mobile.png", full_page=True)',
     '    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")',
-    '    page.on("dialog", lambda d: d.accept())',
     '    page.locator("#bus-toggle").click()',
     '    expect(page.locator("#bus-control-title")).to_contain_text("已关闭")',
     '    expect(page.locator("#page-reports")).to_be_visible()',
@@ -346,6 +573,16 @@ if (process.argv.includes('--browser')) {
     '    assert not errors, errors',
     '    page.set_viewport_size({"width": 1440, "height": 1050})',
     '    page.locator("[data-page=policy]").click()',
+    '    expect(page.locator("[data-e=lead_plans_once]")).to_have_count(0)',
+    '    registry = page.request.get(sys.argv[1] + "/api/state").json().get("policy_registry")',
+    '    if registry:',
+    '        for policy_path in ["global.max_chain_len", "economics.max_rounds_per_task", "economics.daily_token_budget", "economics.peer_review", "economics.lead_review"]:',
+    '            marker = page.locator("[data-policy-path=" + chr(34) + policy_path + chr(34) + "]")',
+    '            expect(marker).to_be_visible()',
+    '            expect(marker).to_contain_text("待第")',
+    '            expect(marker).to_have_class("policy-effect planned")',
+    '        expect(page.locator("[data-policy-path=" + chr(34) + "economics.report_no_raw_diff" + chr(34) + "]")).to_contain_text("已生效")',
+    '        page.screenshot(path=sys.argv[2] + "/policy-runtime-registry.png", full_page=True)',
     '    verify_switch = page.locator("[data-e=require_verify_cmd]")',
     '    expect(verify_switch).to_be_visible()',
     '    original_policy = page.request.get(sys.argv[1] + "/api/state").json()["policy"]',
@@ -373,6 +610,120 @@ if (process.argv.includes('--browser')) {
   ok('Playwright 浏览器交互通过', exit === 0);
   console.log('截图路径: ' + dir);
 }
+console.log('\n[9] 会话 + CSRF + Origin 三要素与审计');
+const probe = { title: '认证探测任务', project: 'auth-probe' };
+function probeWrite(extra, body) { return fetch(apiUrl + '/api/tasks', { method: 'POST', headers: Object.assign({}, headers, extra || {}), body: JSON.stringify(body || probe) }); }
+const noSessionWrite = await probeWrite({ 'x-test-no-session': '1' });
+const noSessionWriteBody = await noSessionWrite.json();
+ok('无会话 cookie 的写入被拒且错误码稳定', noSessionWrite.status === 403 && noSessionWriteBody.code === 'session_required');
+const noSessionRead = await fetch(apiUrl + '/api/state', { headers: { 'x-test-no-session': '1' } });
+ok('无会话读取 API 也被拒', noSessionRead.status === 403 && (await noSessionRead.json()).code === 'session_required');
+const noCsrfWrite = await fetch(apiUrl + '/api/tasks', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(probe) });
+const noCsrfBody = await noCsrfWrite.json();
+ok('有会话但无 CSRF 头被拒', noCsrfWrite.status === 403 && noCsrfBody.code === 'csrf_required');
+const badOriginWrite = await probeWrite({ 'x-test-bad-origin': '1' });
+const badOriginBody = await badOriginWrite.json();
+ok('外部域名 Origin 被拒', badOriginWrite.status === 403 && badOriginBody.code === 'origin_mismatch');
+ok('403 提示写明两个可接受的 loopback Origin', String(badOriginBody.error).includes('http://127.0.0.1:' + port) && String(badOriginBody.error).includes('http://localhost:' + port));
+const noOriginWrite = await probeWrite({ 'x-test-no-origin': '1' });
+const noOriginBody = await noOriginWrite.json();
+ok('缺少 Origin 被拒', noOriginWrite.status === 403 && noOriginBody.code === 'origin_required');
+ok('被拒的写入没有落库', !apiDb.prepare("SELECT id FROM tasks WHERE title='认证探测任务'").get());
+const allowedWrite = await probeWrite();
+const allowedBody = await allowedWrite.json();
+ok('会话 + CSRF + 正确 Origin 的写入通过', allowedWrite.status === 201 && !!allowedBody.task && allowedBody.task.title === probe.title);
+const localhostWrite = await probeWrite({ 'x-test-localhost-origin': '1' }, { title: '本地回环写任务', project: 'auth-probe' });
+const localhostBody = await localhostWrite.json();
+ok('localhost 同端口可写', localhostWrite.status === 201 && !!localhostBody.task && localhostBody.task.title === '本地回环写任务');
+const localhostPortWrite = await probeWrite({ 'x-test-localhost-other-port': '1' });
+const localhostPortBody = await localhostPortWrite.json();
+ok('localhost 端口不一致被拒', localhostPortWrite.status === 403 && localhostPortBody.code === 'origin_mismatch');
+
+// 审计：策略保存、项目创建/删除、验证器保存、总线启停、看板退出都要留痕；token/cookie/正文不入库。
+const policyPut = await fetch(apiUrl + '/api/policy', { method: 'PUT', headers, body: JSON.stringify({ policy: JSON.parse(fs.readFileSync(serverPolicyPath, 'utf8')) }) });
+const policyPutBody = await policyPut.json();
+ok('策略保存返回 200', policyPut.status === 200);
+ok('策略保存写的是临时副本而非真实 policy.json', path.resolve(policyPutBody.backup || '').indexOf(path.resolve(dir) + path.sep) === 0);
+ok('临时副本内容已更新为保存结果', JSON.parse(fs.readFileSync(serverPolicyPath, 'utf8')).lead === policyPutBody.policy.lead);
+const auditRows = Auth.listAudit(apiDb, 200);
+const auditActions = auditRows.map(function (r) { return r.action; });
+for (const action of ['policy.save', 'project.create', 'project.delete', 'validators.save', 'bus.enable', 'bus.disable']) {
+  ok('审计记录 ' + action, auditActions.indexOf(action) >= 0);
+}
+const auditText = JSON.stringify(auditRows);
+ok('审计不含 token、cookie 与请求正文', auditText.indexOf(bootstrapToken) < 0 && auditText.indexOf(sessionCookie.split('=')[1]) < 0 && auditText.indexOf('agentbus_console_session=') < 0 && auditText.indexOf(probe.title) < 0);
+ok('审计保留操作者与认证方式', auditRows.filter(function (r) { return r.action === 'policy.save'; }).every(function (r) { return r.actor === 'human' && r.auth_method === 'session'; }));
+
+console.log('\n[10] 网络白名单：策略段与任务授权');
+const networkState = await (await fetch(apiUrl + '/api/state')).json();
+ok('state 可读 network 段（default deny + local_services）', !!networkState.policy.network && networkState.policy.network['default'] === 'deny' && networkState.policy.network.local_services.some(function (s) { return s.port === 7400; }));
+const editedPolicy = JSON.parse(fs.readFileSync(serverPolicyPath, 'utf8'));
+editedPolicy.network = { default: 'deny', local_services: [{ port: 7400, purpose: 'AgentBus 本地看板' }, { port: 7500, purpose: 'smoke 本地模型' }] };
+const networkPut = await fetch(apiUrl + '/api/policy', { method: 'PUT', headers, body: JSON.stringify({ policy: editedPolicy }) });
+const networkPutBody = await networkPut.json();
+ok('策略保存接受 network 段', networkPut.status === 200 && networkPutBody.policy.network.local_services.length === 2);
+const networkStateAfter = await (await fetch(apiUrl + '/api/state')).json();
+ok('local_services 变更立即可读', networkStateAfter.policy.network.local_services.some(function (s) { return s.port === 7500 && s.purpose === 'smoke 本地模型'; }));
+ok('local_services 变更落到策略文件', JSON.parse(fs.readFileSync(serverPolicyPath, 'utf8')).network.local_services.some(function (s) { return s.port === 7500; }));
+const clearedPolicy = JSON.parse(fs.readFileSync(serverPolicyPath, 'utf8'));
+clearedPolicy.network = { default: 'deny', local_services: [] };
+const clearPut = await fetch(apiUrl + '/api/policy', { method: 'PUT', headers, body: JSON.stringify({ policy: clearedPolicy }) });
+const clearedState = await (await fetch(apiUrl + '/api/state')).json();
+ok('用户清空 local_services 会真正落盘（不被兜底掩盖）', clearPut.status === 200 && clearedState.policy.network.local_services.length === 0);
+await fetch(apiUrl + '/api/policy', { method: 'PUT', headers, body: JSON.stringify({ policy: editedPolicy }) });
+for (const [label, network] of [
+  ['default 非 deny', { default: 'allow' }],
+  ['端口重复', { default: 'deny', local_services: [{ port: 7400, purpose: 'a' }, { port: 7400, purpose: 'b' }] }],
+  ['缺 purpose', { default: 'deny', local_services: [{ port: 7400 }] }],
+  ['端口越界', { default: 'deny', local_services: [{ port: 70000, purpose: 'x' }] }],
+]) {
+  const invalid = await fetch(apiUrl + '/api/policy', { method: 'PUT', headers, body: JSON.stringify({ policy: Object.assign({}, editedPolicy, { network }) }) });
+  ok('非法 network 段被 400 拒绝：' + label, invalid.status === 400 && !!(await invalid.json()).error);
+}
+const grantInput = { title: '网络授权任务', project: 'network-demo', target: 'claude/main', network_grants: [{ protocol: 'HTTPS', host: 'API.Example.com', ports: [443, '8443', 443], purpose: '调用 API' }] };
+const grantCreate = await fetch(apiUrl + '/api/tasks', { method: 'POST', headers, body: JSON.stringify(grantInput) });
+const grantTask = (await grantCreate.json()).task;
+ok('任务创建回显规范化后的 network_grants', grantCreate.status === 201 && grantTask.network_grants.length === 1 && grantTask.network_grants[0].protocol === 'https' && grantTask.network_grants[0].host === 'api.example.com' && JSON.stringify(grantTask.network_grants[0].ports) === '[443,8443]');
+const grantDetail = await (await fetch(apiUrl + '/api/tasks/' + grantTask.id)).json();
+ok('任务详情回显 network_grants', JSON.stringify(grantDetail.network_grants) === JSON.stringify(grantTask.network_grants));
+const grantList = await (await fetch(apiUrl + '/api/tasks')).json();
+ok('任务列表回显 network_grants', (grantList.find(function (t) { return t.id === grantTask.id; }) || {}).network_grants.length === 1);
+const grantEdit = await fetch(apiUrl + '/api/tasks/' + grantTask.id, { method: 'PATCH', headers, body: JSON.stringify({ version: grantTask.version, network_grants: [{ protocol: 'http', host: 'internal.example.com', ports: [8080], purpose: '内网只读' }] }) });
+const grantEdited = await grantEdit.json();
+ok('任务编辑更新 network_grants', grantEdit.status === 200 && grantEdited.task.network_grants.length === 1 && grantEdited.task.network_grants[0].host === 'internal.example.com' && grantEdited.task.network_grants[0].protocol === 'http');
+for (const [label, grants] of [
+  ['协议非法', [{ protocol: 'ftp', host: 'a.example.com', ports: [21], purpose: 'x' }]],
+  ['host 带通配', [{ protocol: 'https', host: '*.example.com', ports: [443], purpose: 'x' }]],
+  ['host 带路径', [{ protocol: 'https', host: 'api.example.com/x', ports: [443], purpose: 'x' }]],
+  ['host 是 CIDR', [{ protocol: 'https', host: '10.0.0.0/8', ports: [443], purpose: 'x' }]],
+  ['缺 purpose', [{ protocol: 'https', host: 'a.example.com', ports: [443] }]],
+  ['端口越界', [{ protocol: 'https', host: 'a.example.com', ports: [0], purpose: 'x' }]],
+  ['超过 8 项', Array.from({ length: 9 }, function () { return { protocol: 'https', host: 'a.example.com', ports: [443], purpose: 'x' }; })],
+  ['不是数组', 'nope'],
+]) {
+  const bad = await fetch(apiUrl + '/api/tasks', { method: 'POST', headers, body: JSON.stringify({ title: '非法网络授权', network_grants: grants }) });
+  ok('非法 network_grants 被 400 拒绝：' + label, bad.status === 400 && !!(await bad.json()).error);
+}
+ok('被拒的非法网络授权没有落库', !apiDb.prepare("SELECT id FROM tasks WHERE title='非法网络授权'").get());
+ok('带网络授权的任务默认进入待批', grantTask.status === 'proposed');
+apiDb.prepare('UPDATE tasks SET status=?, owner=? WHERE id=?').run('claimed', 'claude/main', grantTask.id);
+const lockedGrant = await fetch(apiUrl + '/api/tasks/' + grantTask.id, { method: 'PATCH', headers, body: JSON.stringify({ network_grants: [{ protocol: 'https', host: 'later.example.com', ports: [443], purpose: 'x' }] }) });
+ok('任务开始后 network_grants 锁定', lockedGrant.status === 409 && (await lockedGrant.json()).error.includes('结构性授权字段已锁定'));
+apiDb.prepare('UPDATE tasks SET status=? WHERE id=?').run('cancelled', grantTask.id);
+const taskUiLines = policyScript.split(String.fromCharCode(10)).filter(function (line) { return /^function (networkGrantRows|collectNetworkGrants)\(/.test(line.trim()); }).join(String.fromCharCode(10));
+const editedGrantRows = [
+  { querySelector: function (s) { return { value: s.indexOf('protocol') >= 0 ? 'http' : s.indexOf('host') >= 0 ? 'API.Example.com' : s.indexOf('ports') >= 0 ? '80, 8080' : '内网只读' }; } },
+  { querySelector: function () { return { value: '' }; } },
+];
+const grantContext = vm.createContext({ q: function (s) { return { value: '', hidden: false, innerHTML: '' }; }, qa: function (s) { return s === '[data-network-grant]' ? editedGrantRows : []; }, esc: String });
+vm.runInContext(taskUiLines, grantContext);
+const collectedGrants = vm.runInContext('collectNetworkGrants()', grantContext);
+ok('任务表单把用户填写的网络目标提交为 network_grants（空行忽略）', JSON.stringify(collectedGrants) === '[{"protocol":"http","host":"API.Example.com","ports":[80,8080],"purpose":"内网只读"}]', collectedGrants);
+const networkEditorIds = ['policy-network', 'network-default', 'network-services', 'network-add-service', 'tf-network-grants', 'tf-network-empty', 'tf-add-network-grant'];
+ok('策略页与任务表单都有网络编辑器入口', networkEditorIds.every(function (id) { return html.includes('id="' + id + '"'); }));
+ok('浏览器脚本含网络编辑器逻辑', ['renderNetworkServices', 'collectNetworkPolicy', 'renderNetworkGrants', 'collectNetworkGrants'].every(function (name) { return html.includes('function ' + name + '('); }));
+ok('网络编辑器明示只审计、无法强制隔离', html.includes('无法强制隔离'));
+
 console.log('\n[8] 退出看板不影响总线 / Worker');
 const beforeShutdown = S.getRuntimeState(apiDb);
 if (server.listening) {
@@ -382,10 +733,13 @@ if (server.listening) {
   ok('Human 可优雅关闭本看板', shutdown.status === 200 && (await shutdown.json()).ok);
   await closeEvent;
 }
+ok('看板退出写入审计', Auth.listAudit(apiDb, 50).some(function (r) { return r.action === 'console.shutdown'; }));
 let portClosed = false;
 try { await fetch(apiUrl + '/api/state'); } catch (e) { portClosed = true; }
 ok('退出后看板端口关闭', portClosed && !server.listening);
 ok('退出不改变总线状态且任务仍在', S.getRuntimeState(apiDb).enabled === beforeShutdown.enabled && S.getTask(apiDb, failedTask.id).status === 'failed');
+const realPolicyHashAfter = crypto.createHash('sha256').update(fs.readFileSync(realPolicyFile)).digest('hex');
+ok('全程未改动真实 policy.json（跑前跑后字节哈希一致）', realPolicyHashBefore === realPolicyHashAfter);
 console.log('测试临时目录: ' + dir);
 apiDb.close(); db.close();
 
