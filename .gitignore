@@ -1,0 +1,16 @@
+# 运行时状态，不入库
+bus/bus.db
+bus/bus.db-wal
+bus/bus.db-shm
+bus/logs/
+bus/test-*.db*
+bus/projects.json
+bus/projects.json.lock
+bus/policy.json.bak-*
+bus/_t*.mjs
+node_modules/
+workspaces/
+plans/
+docs/agent-bus-plan.md
+.tmp-*
+启动看板.cmd

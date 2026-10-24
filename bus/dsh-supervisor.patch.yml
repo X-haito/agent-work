@@ -1,0 +1,12 @@
+# One-shot DSH sessions inherit the user's saved sign-in, but do not mount interactive MCP clients.
+# AgentBus claim/lease/reporting is owned by dsh-supervisor.mjs for these runs.
+- id: credentials
+  disabled: false
+- id: authorization
+  disabled: false
+- id: deepseek-account
+  disabled: false
+- id: agentmemory
+  disabled: true
+- id: agentbus
+  disabled: true
