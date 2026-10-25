@@ -1,0 +1,25 @@
+name: smoke
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: 语法检查
+        run: node --check bus/cli.mjs
+      - name: 全量测试（CI profile：必需套件被跳过即失败）
+        run: node bus/smoke-all.mjs --profile ci --json
+      - name: 发布包检查
+        run: node bus/cli.mjs release-check --skip-smoke
