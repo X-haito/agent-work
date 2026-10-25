@@ -141,10 +141,16 @@ export async function runReleaseCheck(options) {
     detail: pack.files.length + ' 个文件 / ' + pack.total_bytes + ' 字节' + (pack.violations.length ? '；命中敏感项: ' + pack.violations.map(function (v) { return v.path; }).join(', ') : '；未命中任何敏感项'),
     fix: pack.ok ? null : '从 package.json 的 files 白名单里移除这些路径，或把它们加进 .npmignore' });
 
-  const doctorRun = await exec(process.execPath, [cli, 'doctor', '--json'], { cwd: root });
+  // 发布检查要验证「全新安装后是否健康」，而不是「这台机器初始化过没有」。
+  // 空 runner 上 bus/bus.db 本来就不存在，用真实 HOME 跑 doctor 必然 FAIL（CI 上就卡在这）。
+  const releaseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-release-'));
+  const releaseEnv = { HOME: releaseHome, USERPROFILE: releaseHome, BUS_DB: path.join(releaseHome, 'bus.db'), BUS_PROJECTS: path.join(releaseHome, 'projects.json') };
+  const initRun = await exec(process.execPath, [cli, 'init'], { cwd: root, env: releaseEnv });
+  const initOk = Number(initRun && initRun.code) === 0;
+  const doctorRun = await exec(process.execPath, [cli, 'doctor', '--json'], { cwd: root, env: releaseEnv });
   let doctorReport = null;
   try { doctorReport = JSON.parse(String(doctorRun.stdout || '').slice(String(doctorRun.stdout || '').indexOf('{'))); } catch (e) { doctorReport = null; }
-  const doctorOk = !!doctorReport && Number(doctorReport.counts && doctorReport.counts.fail) === 0;
+  const doctorOk = initOk && !!doctorReport && Number(doctorReport.counts && doctorReport.counts.fail) === 0;
   // 只报计数等于让人去猜哪一项红了（CI 上就是这样被卡住一轮）：把失败项的名字与修复命令直接打出来。
   const failingChecks = doctorReport && Array.isArray(doctorReport.checks) ? doctorReport.checks.filter(function (c) { return c.status === 'fail'; }) : [];
   const doctorDetail = doctorReport
@@ -152,7 +158,7 @@ export async function runReleaseCheck(options) {
        + (failingChecks.length ? '；失败项: ' + failingChecks.map(function (c) { return c.title + ' — ' + String(c.detail || '').slice(0, 200); }).join(' | ') : ''))
     : ('无法解析 doctor 输出: ' + String((doctorRun.stderr || doctorRun.error || '').slice(0, 200)));
   steps.push({ id: 'doctor', title: 'agentbus doctor --json', status: doctorOk ? (Number(doctorReport.counts.warn) > 0 ? 'warn' : 'ok') : 'fail',
-    detail: doctorDetail,
+    detail: (initOk ? '' : 'agentbus init 失败（全新安装不可用）: ' + String((initRun.stderr || initRun.error || '').slice(0, 200)) + '；') + doctorDetail + '（在临时 HOME 里先 init 再诊断）',
     fix: doctorOk ? null : (failingChecks.length ? failingChecks.map(function (c) { return c.fix; }).filter(Boolean).join(' / ') : '按 agentbus doctor 的修复命令逐项处理后再发布') });
 
   if (o.skipSmoke === true) {
@@ -185,5 +191,7 @@ export async function runReleaseCheck(options) {
 
   const counts = { ok: 0, warn: 0, skip: 0, fail: 0 };
   for (const step of steps) counts[step.status] = (counts[step.status] || 0) + 1;
+  // 临时 HOME 用完即删：发布检查不该在临时目录里留运行数据。
+  try { fs.rmSync(releaseHome, { recursive: true, force: true }); } catch (e) {}
   return { ok: counts.fail === 0, version: pack.version, root: root, steps: steps, counts: counts, pack: { files: pack.files.length, bytes: pack.total_bytes, violations: pack.violations } };
 }
