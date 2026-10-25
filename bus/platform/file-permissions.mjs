@@ -68,7 +68,10 @@ export function harden(filePath, options) {
   if (!file) return { ok: false, method: 'unsupported', detail: '空路径' };
   if (!fs.existsSync(file)) return { ok: false, method: 'unsupported', detail: '文件不存在: ' + file };
   const run = (options && options.run) || runSync;
-  if (!IS_WIN) {
+  // 注入桩即视为要测 icacls 分支：否则 Windows 逻辑在 POSIX 上永远测不到
+  // （生产从不传 run/user，行为不变）。
+  const forced = !!(options && (options.run || options.user || options.forceIcacls));
+  if (!IS_WIN && !forced) {
     try {
       fs.chmodSync(file, 0o600);
       const mode = fs.statSync(file).mode & 0o777;
@@ -119,7 +122,8 @@ export function verify(filePath, options) {
   if (!file) return { ok: false, method: 'unsupported', detail: '空路径' };
   if (!fs.existsSync(file)) return { ok: false, method: 'unsupported', detail: '文件不存在: ' + file };
   const run = (options && options.run) || runSync;
-  if (!IS_WIN) {
+  const forced = !!(options && (options.run || options.user || options.forceIcacls));
+  if (!IS_WIN && !forced) {
     try {
       const mode = fs.statSync(file).mode & 0o777;
       const ok = (mode & 0o077) === 0;

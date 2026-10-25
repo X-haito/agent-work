@@ -107,7 +107,13 @@ ok('未超龄的归档包留下（1 天 < 10 天阈值）', fs.existsSync(bundle
 ok('非管辖文件不受影响', fs.existsSync(stray));
 ok('删除统计与审计落库', applied.totals.deleted === 3 &&
   db.prepare("SELECT COUNT(*) AS c FROM audit_log WHERE action='archive_retention.applied'").get().c === 1, applied.totals);
-if (symlinkMade) ok('符号链接没有被当成候选', !applied.deleted.some(f => /bus-link\.db$/.test(f.path)) && fs.existsSync(path.join(archiveDir, 'bus-link.db')));
+if (symlinkMade) {
+  // 目标文件可能已被删（悬空链接）：existsSync 会跟随链接返回 false，必须用 lstat 看链接本身。
+  const linkPath = path.join(archiveDir, 'bus-link.db');
+  let linkStillThere = false;
+  try { linkStillThere = fs.lstatSync(linkPath).isSymbolicLink(); } catch (e) { linkStillThere = false; }
+  ok('符号链接没有被当成候选（目标被删后链接本身仍在）', !applied.deleted.some(f => /bus-link\.db$/.test(f.path)) && linkStillThere, { linkStillThere, deleted: applied.totals });
+}
 
 // 路径逃逸：计划里塞一个 root 外的路径，apply 必须拒绝
 const outside = writeFile(path.join(tmp, 'outside.db'), 'outside', 400);

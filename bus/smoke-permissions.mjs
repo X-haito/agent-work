@@ -62,6 +62,22 @@ ok('多出受托人时 verify 判不合格', aceOther.ok === false && /BUILTIN/.
 const aceInherited = FP.verify(plainFile, { run: () => ({ status: 0, stdout: plainFile + ' HOST\\tester:(I)(F)\n', stderr: '' }), user: fakeUser });
 ok('仍带继承标记时 verify 判不合格', aceInherited.ok === false && /继承/.test(aceInherited.detail), aceInherited);
 
+// POSIX 分支：此前只有 Windows 跑过（台账 D4 的空白）。这里补上真实 chmod 语义。
+if (process.platform === 'win32') {
+  console.log('  SKIP  POSIX 分支（chmod 0600）—— 当前是 win32，不是 PASS');
+} else {
+  const posixFile = path.join(temp, 'posix-mode.json');
+  fs.writeFileSync(posixFile, '{}\n');
+  fs.chmodSync(posixFile, 0o644);
+  const loose = FP.verify(posixFile);
+  ok('POSIX：0644 时 verify 判不合格', loose.ok === false && loose.method === 'posix', loose);
+  const narrowed = FP.harden(posixFile);
+  const afterNarrow = FP.verify(posixFile);
+  ok('POSIX：harden 收窄为 0600 且 verify 通过', narrowed.ok === true && narrowed.method === 'posix' && afterNarrow.ok === true, { narrowed, afterNarrow });
+  const mode = fs.statSync(posixFile).mode & 0o777;
+  ok('POSIX：实际模式不含 group/other 权限位', (mode & 0o077) === 0, mode.toString(8));
+}
+
 // ---------- [2] admin-config：加固结果记录在 acl 字段，且不因为改不了 ACL 就写不进配置 ----------
 const homeDir = path.join(temp, 'home');
 fs.mkdirSync(path.join(homeDir, '.codex'), { recursive: true });
