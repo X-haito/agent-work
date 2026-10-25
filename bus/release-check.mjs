@@ -145,9 +145,15 @@ export async function runReleaseCheck(options) {
   let doctorReport = null;
   try { doctorReport = JSON.parse(String(doctorRun.stdout || '').slice(String(doctorRun.stdout || '').indexOf('{'))); } catch (e) { doctorReport = null; }
   const doctorOk = !!doctorReport && Number(doctorReport.counts && doctorReport.counts.fail) === 0;
+  // 只报计数等于让人去猜哪一项红了（CI 上就是这样被卡住一轮）：把失败项的名字与修复命令直接打出来。
+  const failingChecks = doctorReport && Array.isArray(doctorReport.checks) ? doctorReport.checks.filter(function (c) { return c.status === 'fail'; }) : [];
+  const doctorDetail = doctorReport
+    ? ('ok=' + doctorReport.counts.ok + ' warn=' + doctorReport.counts.warn + ' fail=' + doctorReport.counts.fail
+       + (failingChecks.length ? '；失败项: ' + failingChecks.map(function (c) { return c.title + ' — ' + String(c.detail || '').slice(0, 200); }).join(' | ') : ''))
+    : ('无法解析 doctor 输出: ' + String((doctorRun.stderr || doctorRun.error || '').slice(0, 200)));
   steps.push({ id: 'doctor', title: 'agentbus doctor --json', status: doctorOk ? (Number(doctorReport.counts.warn) > 0 ? 'warn' : 'ok') : 'fail',
-    detail: doctorReport ? ('ok=' + doctorReport.counts.ok + ' warn=' + doctorReport.counts.warn + ' fail=' + doctorReport.counts.fail) : ('无法解析 doctor 输出: ' + String((doctorRun.stderr || doctorRun.error || '').slice(0, 200))),
-    fix: doctorOk ? null : '按 agentbus doctor 的修复命令逐项处理后再发布' });
+    detail: doctorDetail,
+    fix: doctorOk ? null : (failingChecks.length ? failingChecks.map(function (c) { return c.fix; }).filter(Boolean).join(' / ') : '按 agentbus doctor 的修复命令逐项处理后再发布') });
 
   if (o.skipSmoke === true) {
     steps.push({ id: 'smoke', title: '全量 smoke', status: 'skip', detail: '按 --skip-smoke 跳过', fix: null });
