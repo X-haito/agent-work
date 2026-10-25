@@ -44,7 +44,10 @@ try {
   check('claimed task issues canonical roots and idempotent current grant',()=>{
     const c=claimed({extra_dirs:[outside,'.',outside],redline:['cfg:edit'],grants:['fs:delete']});
     const result=S.issueExecutionGrant(db,c.id,'worker/main',{task_version:c.version,probe:VALID_PROBE});assert(result.ok,JSON.stringify(result));
-    assert.deepEqual(result.grant.roots,[fs.realpathSync(project),fs.realpathSync(outside)]);
+    // 必须与生产用同一个规范化函数：fs.realpathSync 不解析 Windows 8.3 短名（RUNNER~1），
+    // .native 才解析成长名（runneradmin）。用弱的那个比强的那个，Windows CI 上必然不等。
+    const canon=(p)=>{try{return fs.realpathSync.native(p)}catch(e){return fs.realpathSync(p)}};
+    assert.deepEqual(result.grant.roots,[canon(project),canon(outside)]);
     assert.deepEqual(result.grant.redline,['cfg:edit','fs:delete']);
     assert.equal(result.grant.task_version,c.version);
     assert.equal(S.issueExecutionGrant(db,c.id,'worker/main',{probe:VALID_PROBE}).grant.grant_id,result.grant.grant_id);
