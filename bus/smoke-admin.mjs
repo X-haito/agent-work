@@ -9,6 +9,20 @@ import { createBoardServer } from './console-server.mjs';
 import * as Auth from './auth.mjs';
 import vm from 'node:vm';
 
+// Windows CI 上 Node 的 fetch（undici）复用连接时偶发 ECONNRESET（这轮实测 14s 的慢机器上出现）。
+// 只对「连接被重置/管道断开」重试一次：不掩盖真实的业务错误或 4xx/5xx。
+const __rawFetch = globalThis.fetch;
+globalThis.fetch = async function (input, init) {
+  try { return await __rawFetch(input, init); }
+  catch (error) {
+    const cause = error && error.cause ? String(error.cause.code || error.cause.message || '') : '';
+    const code = String((error && error.code) || '') + ' ' + cause;
+    if (/ECONNRESET|EPIPE|ECONNREFUSED/.test(code)) return await __rawFetch(input, init);
+    throw error;
+  }
+};
+
+
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-admin-'));
 const db = S.openDb(path.join(dir, 'bus.db'));
 S.setRuntimeState(db, 'human', true);
