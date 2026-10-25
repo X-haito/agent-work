@@ -87,7 +87,9 @@ export function harden(filePath, options) {
   if (strip.status !== 0) {
     return { ok: false, method: 'icacls', detail: '关闭继承失败: ' + String(strip.stderr || strip.stdout || strip.error || '').slice(0, 300) };
   }
-  const grant = run('icacls', [file, '/grant:r', user.sid + ':F']);
+  // icacls 里 SID 必须写成 *S-1-5-...，否则它会当成账户名去解析，
+  // 在 CI runner 上报「No mapping between account names and security IDs」。
+  const grant = run('icacls', [file, '/grant:r', '*' + user.sid + ':F']);
   if (grant.status !== 0) {
     return { ok: false, method: 'icacls', detail: '授予当前用户失败: ' + String(grant.stderr || grant.stdout || grant.error || '').slice(0, 300) };
   }

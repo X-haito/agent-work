@@ -158,7 +158,7 @@ export async function runReleaseCheck(options) {
        + (failingChecks.length ? '；失败项: ' + failingChecks.map(function (c) { return c.title + ' — ' + String(c.detail || '').slice(0, 200); }).join(' | ') : ''))
     : ('无法解析 doctor 输出: ' + String((doctorRun.stderr || doctorRun.error || '').slice(0, 200)));
   steps.push({ id: 'doctor', title: 'agentbus doctor --json', status: doctorOk ? (Number(doctorReport.counts.warn) > 0 ? 'warn' : 'ok') : 'fail',
-    detail: (initOk ? '' : 'agentbus init 失败（全新安装不可用）: ' + String((initRun.stderr || initRun.error || '').slice(0, 200)) + '；') + doctorDetail + '（在临时 HOME 里先 init 再诊断）',
+    detail: (initOk ? '' : 'agentbus init 失败（全新安装不可用）exit=' + initRun.code + '；stderr 尾部: ' + String(initRun.stderr || initRun.error || '').split('\n').slice(-6).join(' / ').slice(-600) + '；stdout 尾部: ' + String(initRun.stdout || '').split('\n').slice(-6).join(' / ').slice(-600) + '；') + doctorDetail + '（在临时 HOME 里先 init 再诊断）',
     fix: doctorOk ? null : (failingChecks.length ? failingChecks.map(function (c) { return c.fix; }).filter(Boolean).join(' / ') : '按 agentbus doctor 的修复命令逐项处理后再发布') });
 
   if (o.skipSmoke === true) {

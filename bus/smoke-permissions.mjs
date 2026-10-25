@@ -54,7 +54,7 @@ const okRun = (cmd, args) => {
 const stubHarden = FP.harden(plainFile, { run: okRun, user: fakeUser });
 ok('harden 用参数数组调用 icacls（不拼 shell 字符串）',
   stubHarden.ok === true && calls.some(c => c[0] === 'icacls' && c[1] === plainFile && c[2] === '/inheritance:r') &&
-  calls.some(c => c[0] === 'icacls' && c[2] === '/grant:r' && c[3] === fakeUser.sid + ':F'),
+  calls.some(c => c[0] === 'icacls' && c[2] === '/grant:r' && c[3] === '*' + fakeUser.sid + ':F'),
   JSON.stringify(calls));
 ok('harden 在 icacls 失败时不返回 ok:true',
   FP.harden(plainFile, { run: () => ({ status: 1, stdout: '', stderr: 'Access is denied.' }), user: fakeUser }).ok === false);
