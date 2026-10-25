@@ -87,6 +87,37 @@ node bus/dsh-supervisor.mjs --daemon
 
 首次验证建议选择 `standard`，写入范围只填项目内的相对路径。当前网页还不能填写 `verify_cmd`、`extra_dirs` 和细粒度授权；默认开启 `require_verify_cmd` 时，`mechanical`、`tests`、`docs` 三类任务会因缺少 `verify_cmd` 被拒绝。完整字段支持已列入 [dsh-todo-list.md](dsh-todo-list.md)。
 
+## 安装、诊断与版本（第 12 项）
+
+`package.json` 是**版本号唯一来源**（`agentbus version` 直接读它；MCP `serverInfo.version` 与看板 API 待第 13 项接入后同样引用这一处）。包名 `agentbus`，`bin` 指向 `bus/cli.mjs`，要求 Node >= 24。
+
+```powershell
+node bus/cli.mjs init      # 建运行目录 + 数据库 + projects registry，并按 managed-block 写法配置 MCP
+node bus/cli.mjs doctor    # 只诊断、不改任何东西；每项给修复命令；--json 输出结构化结果
+node bus/cli.mjs start     # 启动看板并打印一次性登录链接（仅本次启动有效）
+node bus/cli.mjs version   # 版本号（--json 附带 node 版本）
+```
+
+`init` 的**每一步**都写进 `bus/install-manifest.json`（创建/修改的文件、sha256、备份路径、结果、时间），它是 `uninstall` 的唯一依据：
+
+- 已存在且启用的 MCP 配置记为 `kept`，不会覆盖你手改过的内容；
+- 缺少 `policy.json` 时从 `bus/policy.example.json` 复制一份（**默认策略示例，请按需修改**；复制时会去掉以 `_` 开头的说明字段）；
+- 重复执行是幂等的：同一路径在 manifest 里只保留一条最新记录。
+
+```powershell
+node bus/cli.mjs uninstall                # 只移除 manifest 记录过的 managed block；数据库/策略保留
+node bus/cli.mjs uninstall --purge-data --yes   # 连数据库与策略一起删（缺 --yes 会先列出待删文件）
+node bus/cli.mjs release-check            # 打包清单 + doctor + 全量 smoke + npm pack 检查
+```
+
+
+`doctor` 覆盖 Node 版本、三个 Agent CLI（**只扫 PATH，不执行外部程序**）、看板端口占用、SQLite 可写性与 WAL、schema 版本、策略校验、项目路径、MCP 配置与权限、凭据、supervisor 心跳。任何 FAIL 都会让退出码为 1。它**从不自动修改**任何东西——数据库不存在时也不会顺手建一个。
+
+### 发布包不含什么
+
+`package.json` 的 `files` 是显式白名单，只打包 `bus/**/*.mjs`、`bus/schema.sql`、`bus/ui/*.css`、`README.md`、`package.json`。**不会**打包运行数据：`bus.db`（及 `-wal/-shm`）、`bus/logs/`、`bus/projects.json`、`bus/policy.json`、`bus/workspaces/`、`install-manifest.json`、`*.bak-*`、`*.tmp-*`。`bus/smoke-install.mjs` 会按这份白名单真实枚举一次仓库文件，确认上述敏感项一个都没被带进去。
+
+> 第 13 项要接入的官方 MCP v2 与 Zod v4 在 `package.json` 的 `dependenciesReservedForItem13` 里**只占位不写假版本号**；真正锁定版本在接入那张卡里做。
 ## MCP 手动配置
 
 通常直接在看板“MCP 配置”页操作。需要手动配置时，将示例路径替换为仓库绝对路径。
@@ -161,26 +192,45 @@ Supervisor 会在执行前后比较文件快照。越权修改会使任务失败
 
 ## 验证
 
+全量回归只有一个入口（自动发现并运行 `bus/smoke*.mjs`，数字以运行时输出为准，本文不再手写）：
+
 ```powershell
-node bus/smoke.mjs
-node bus/smoke-mcp.mjs
-node bus/smoke-e2e.mjs
-node bus/smoke-admin.mjs
-node bus/smoke-guard.mjs
-node bus/smoke-routing.mjs
-node bus/smoke-cost.mjs
-node bus/smoke-project.mjs
-node bus/smoke-runtime.mjs
-node bus/smoke-supervisor-evidence.mjs
+node bus/smoke-all.mjs            # 人读汇总
+node bus/smoke-all.mjs --json     # 机器读汇总
+node bus/smoke-all.mjs --strict   # CI 用：需要管道/端口的套件被跳过也算失败
 ```
 
-当前共 292 项断言。也可以运行：
+依赖管道 stdio 或端口的套件在受限环境会记为 `SKIP + reason`，不会算成通过。
+
+也可以运行：
 
 ```powershell
 node bus/cli.mjs status
 node bus/cli.mjs agents
 node bus/cli.mjs board
 node bus/cli.mjs cost
+```
+
+
+## 状态词
+
+文档里只用这四个词描述能力，禁止用「已完成/已启用」这类模糊说法代替其中任何一个：
+
+| 词 | 含义 |
+| --- | --- |
+| `implemented` | 代码存在，且有数据层/单元测试 |
+| `wired` | MCP / CLI / 看板三条入口里至少一条真的会走到这段代码 |
+| `enabled` | 默认配置下真的会生效（策略开关打开、阈值非 0、有执行路径） |
+| `verified` | 有自动化测试在当前仓库跑出数字，并被 `bus/smoke-docs.mjs` 校验 |
+
+当前四项能力的四词矩阵与证据见 [bus/DELIVERY-STATUS.md](bus/DELIVERY-STATUS.md)。**四项的 `enabled` 都是 `false`**：
+预算（`daily_token_budget` 未配置）、认证（`require_credentials=false`）、归档（`retention` 全 0）、合并（只允许 Human 发起、runner 未接线）。
+
+数字（工具数、套件数、断言数、端口、Lead）一律以运行时导出为准，本文不手写：
+
+```powershell
+node bus/smoke-docs.mjs --print-facts   # 打印运行时事实，供文档引用
+node bus/smoke-docs.mjs                 # 校验文档与运行时一致
 ```
 
 ## 当前限制

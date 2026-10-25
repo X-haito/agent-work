@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 
 // AgentBus 凭据：库里只存 SHA-256，原文只在签发时返回一次。
 // human 永不签发 MCP 凭据，因此 --agent human 拿不到管理权限。
@@ -42,8 +43,10 @@ export function issueCredential(db, agentId, opts) {
 export function verifyCredential(db, token) {
   if (typeof token !== 'string' || !token) return authFail('auth_required');
   const presented = hashToken(token);
-  const row = db.prepare('SELECT agent_id,token_hash,expires_at,revoked_at FROM agent_credentials WHERE token_hash=?').get(presented);
+  const row = db.prepare('SELECT agent_id,token_hash,expires_at,revoked_at,state FROM agent_credentials WHERE token_hash=?').get(presented);
   if (!row) return authFail('auth_required');
+  // 只有 active 才算数：pending 是"已签发但客户端配置还没确认"，绝不能提前生效
+  if (String(row.state || 'active') !== 'active') return authFail('auth_required');
   const stored = Buffer.from(String(row.token_hash), 'utf8');
   const candidate = Buffer.from(presented, 'utf8');
   if (stored.length !== candidate.length || !crypto.timingSafeEqual(stored, candidate)) return authFail('auth_required');
@@ -51,6 +54,96 @@ export function verifyCredential(db, token) {
   if (row.expires_at && Date.parse(row.expires_at) <= Date.now()) return authFail('expired');
   db.prepare('UPDATE agent_credentials SET last_used_at=? WHERE token_hash=?').run(nowIso(), presented);
   return { ok: true, agent: row.agent_id };
+}
+
+// ---------- staged 轮换（第 5 项） ----------
+// 先插 pending → 客户端把新 token 写进配置并核对 → 再在事务里 activate；
+// 任何一步失败都 abortStaged 撤销 pending，旧 token 始终保持 active 且未被动过宽限期。
+export function rotateCredentialStaged(db, agentId, opts) {
+  const issued = issueCredential(db, agentId, opts || {});
+  if (!issued.ok) return issued;
+  db.prepare("UPDATE agent_credentials SET state='pending' WHERE token_hash=?").run(issued.record.token_hash);
+  return { ok: true, token: issued.token, staged: true, token_hash: issued.record.token_hash, record: issued.record };
+}
+
+export function activateStaged(db, agentId, opts) {
+  const options = opts || {};
+  const graceMs = Number.isSafeInteger(options.graceMs) ? options.graceMs : DEFAULT_GRACE_MS;
+  const pending = db.prepare("SELECT token_hash FROM agent_credentials WHERE agent_id=? AND state='pending' AND revoked_at IS NULL").get(agentId);
+  if (!pending) return { ok: false, reason: 'no_pending', message: '没有待激活的凭据: ' + agentId };
+  const graceUntil = isoOf(Date.now() + graceMs);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare("UPDATE agent_credentials SET state='active' WHERE token_hash=?").run(pending.token_hash);
+    // 旧 active 凭据进入宽限期（不是立刻失效），保证客户端还有切换窗口
+    const graced = db.prepare("UPDATE agent_credentials SET expires_at=? WHERE agent_id=? AND state='active' AND revoked_at IS NULL AND token_hash<>?")
+      .run(graceUntil, agentId, pending.token_hash);
+    db.exec('COMMIT');
+    return { ok: true, activated: true, grace_until: graceUntil, graced: Number(graced.changes) };
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch (inner) { /* ignore */ }
+    return { ok: false, reason: 'activate_failed', message: String((error && error.message) || error) };
+  }
+}
+
+// 撤销 pending，并把被 activate 改动过的旧凭据恢复原样（激活后失败时的补偿）
+export function rollbackStaged(db, agentId, options) {
+  const o = options || {};
+  const ts = nowIso();
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (o.tokenHash) db.prepare("UPDATE agent_credentials SET state='revoked', revoked_at=? WHERE token_hash=?").run(ts, o.tokenHash);
+    db.prepare("UPDATE agent_credentials SET state='revoked', revoked_at=? WHERE agent_id=? AND state='pending' AND revoked_at IS NULL").run(ts, agentId);
+    for (const row of o.previous || []) db.prepare('UPDATE agent_credentials SET expires_at=? WHERE token_hash=?').run(row.expires_at, row.token_hash);
+    db.exec('COMMIT');
+    return { ok: true };
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch (inner) { /* ignore */ }
+    return { ok: false, message: String((error && error.message) || error) };
+  }
+}
+
+// 分阶段轮换编排：写临时文件 → 重新解析核对 → rename → 激活。任一步失败都撤销 pending、
+// 回滚激活、把配置文件恢复成原始字节。fs / serialize / verify / activate 可注入（故障注入用）。
+export function rotateStagedCredential(db, options) {
+  const o = options || {};
+  const fsMod = o.fs || fs;
+  const agentId = o.agentId;
+  const realPath = o.realPath;
+  const tempPath = o.tempPath || (String(realPath) + '.tmp-' + process.pid);
+  if (!agentId || !realPath) return { ok: false, reason: 'invalid_options', message: 'agentId 与 realPath 必填' };
+  const existed = fsMod.existsSync(realPath);
+  const original = existed ? fsMod.readFileSync(realPath) : null;
+  const staged = rotateCredentialStaged(db, agentId, o.credentialOptions || {});
+  if (!staged.ok) return { ok: false, reason: 'stage_failed', message: staged.message };
+  let previous = [];
+  try {
+    const written = o.serialize(tempPath, staged.token);
+    if (written && written.ok === false) throw new Error('serialize: ' + (written.error || 'failed'));
+    const checked = typeof o.verify === 'function' ? o.verify(tempPath, staged.token) : { ok: true };
+    if (checked.ok !== true) throw new Error('verify: ' + (checked.detail || 'mismatch'));
+    previous = db.prepare("SELECT token_hash, expires_at FROM agent_credentials WHERE agent_id=? AND state='active' AND revoked_at IS NULL").all(agentId);
+    if (typeof o.beforeRename === 'function') o.beforeRename(tempPath, realPath);
+    fsMod.renameSync(tempPath, realPath);
+    const activate = typeof o.activate === 'function' ? o.activate : activateStaged;
+    const activated = activate(db, agentId, { graceMs: o.graceMs });
+    if (!activated.ok) throw new Error('activate: ' + (activated.message || activated.reason));
+    return { ok: true, token: staged.token, staged: true, grace_until: activated.grace_until, graced: activated.graced };
+  } catch (error) {
+    try { rollbackStaged(db, agentId, { tokenHash: staged.token_hash, previous: previous }); } catch (inner) { /* ignore */ }
+    try { if (fsMod.existsSync(tempPath)) fsMod.rmSync(tempPath, { force: true }); } catch (inner) { /* ignore */ }
+    try {
+      if (original == null) { if (fsMod.existsSync(realPath)) fsMod.rmSync(realPath, { force: true }); }
+      else fsMod.writeFileSync(realPath, original);
+    } catch (inner) { /* ignore */ }
+    return { ok: false, reason: 'rolled_back', message: String((error && error.message) || error) };
+  }
+}
+
+export function abortStaged(db, agentId) {
+  const r = db.prepare("UPDATE agent_credentials SET state='revoked', revoked_at=? WHERE agent_id=? AND state='pending' AND revoked_at IS NULL")
+    .run(nowIso(), agentId);
+  return { ok: true, revoked: Number(r.changes) };
 }
 
 export function revokeCredential(db, agentId) {

@@ -6,6 +6,7 @@ import path from 'node:path';
 import * as S from './store.mjs';
 import * as G from './guard.mjs';
 import * as R from './redline.mjs';
+import { applyPolicyDefaults } from './policy-schema.mjs';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-guard-'));
 const TDB = path.join(TMP, 'bus.db');
@@ -45,8 +46,20 @@ function arrOf(v) {
 }
 
 console.log('角色: LEAD=' + LEAD + '  W1=' + W1 + '  ACC=' + ACC.join(','));
-// 逐字对得上临时策略 = 证明运行时没读过真实 bus/policy.json
-ok('策略逐字等于临时文件', JSON.stringify(pol) === JSON.stringify(POLICY_OBJ), Object.keys(pol));
+// 对得上临时策略 = 证明运行时没读过真实 bus/policy.json。
+// 注意：不再比「字节相等」——loadPolicy() 会用 policy-schema 补默认值，
+// 所以拿 applyPolicyDefaults 归一化之后再逐字段比较才是有效不变量。
+// loadPolicy 除了补 schema 默认值，还会给 retention 补一份 legacy 别名 max_log_bytes
+// （第 10 项第 13 条正名的过渡桥，等 archive.mjs 改读新名后删除）。比对前两边都按同一规则归一化。
+function normalizePolicy(v) {
+  const out = applyPolicyDefaults(v);
+  if (out.retention && out.retention.max_log_bytes == null && out.retention.max_single_log_bytes != null) {
+    out.retention.max_log_bytes = out.retention.max_single_log_bytes;
+  }
+  return out;
+}
+ok('策略经 schema 归一化后等于临时文件（不再比字节：loadPolicy 会补默认值与 legacy 别名）',
+  JSON.stringify(normalizePolicy(pol)) === JSON.stringify(normalizePolicy(POLICY_OBJ)), Object.keys(pol));
 
 console.log('');
 console.log('[A] 红线分类矩阵');

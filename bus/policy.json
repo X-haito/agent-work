@@ -64,7 +64,17 @@
     "max_subagents": 0,
     "review_timeout_min": 30,
     "require_verify_cmd": true,
-    "daily_token_budget": null
+    "daily_token_budget": null,
+    "budget_timezone": "Asia/Shanghai",
+    "default_turn_reserve": 20000
+  },
+  "retention": {
+    "terminal_task_days": 0,
+    "message_days": 0,
+    "guard_event_days": 0,
+    "raw_usage_days": 0,
+    "log_days": 0,
+    "max_log_bytes": 0
   },
   "agents": {
     "codex/main": {

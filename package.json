@@ -1,0 +1,34 @@
+{
+  "name": "agentbus",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AgentBus：本地多 Agent 协同总线（任务/评审/合并/预算/归档看板）",
+  "bin": {
+    "agentbus": "bus/cli.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "bus/**/*.mjs",
+    "bus/schema.sql",
+    "bus/mcp/**/*.mjs",
+    "bus/ui/*.css",
+    "README.md",
+    "package.json",
+    "bus/policy.example.json"
+  ],
+  "scripts": {
+    "init": "node bus/cli.mjs init",
+    "doctor": "node bus/cli.mjs doctor",
+    "start": "node bus/cli.mjs start",
+    "version": "node bus/cli.mjs version",
+    "smoke": "node bus/smoke-all.mjs"
+  },
+  "dependencies": {},
+  "dependenciesReservedForItem13": {
+    "@modelcontextprotocol/server": "第 13 项接入官方 MCP v2 时在此锁定版本（本卡只预留位置，不写假版本号）",
+    "zod": "第 13 项做 schema 校验时在此锁定 v4"
+  }
+}

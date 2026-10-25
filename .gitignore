@@ -7,6 +7,11 @@ bus/test-*.db*
 bus/projects.json
 bus/projects.json.lock
 bus/policy.json.bak-*
+*.bak-*
+.backup-*
+# 迁移前快照（第 12 项第 5 条）：只在升级瞬间有用，不该进仓库
+bus/migrations-backups/
+install-manifest.json
 bus/_t*.mjs
 node_modules/
 workspaces/

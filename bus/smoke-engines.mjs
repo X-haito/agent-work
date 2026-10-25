@@ -5,6 +5,9 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import * as Codex from './engines/codex.mjs';
+import * as Iso from './isolation/provider.mjs';
+// 强隔离类 grant 现在必须有有效 probe（第 3 项第 10 条），夹具里给真 probe，不放宽闸门。
+const VALID_PROBE = { provider: 'container', probe_version: Iso.PROBE_VERSION, verified: true, write_inside: true, write_outside: false, network_direct: false, network_via_proxy: true, tested_at: new Date().toISOString(), reason: 'verified' };
 import * as Claude from './engines/claude.mjs';
 import * as Dsh from './engines/dsh.mjs';
 import * as S from './store.mjs';
@@ -32,6 +35,14 @@ for (const [name, engine, opts] of [['codex', Codex, {}], ['claude', Claude, {}]
   pass++; console.log('PASS ' + name + ' dry-run 不启动进程');
 }
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-engines-'));
+// unknown_agent 现在是硬拒：占位 actor 必须登记进**本套件自己的临时策略**（真实 policy 打底，不设任何白名单后门）。
+const placeholderPolicy = path.join(temp, 'policy-placeholder.json');
+const placeholderBase = JSON.parse(fs.readFileSync(path.join(S.BUS_DIR, 'policy.json'), 'utf8'));
+placeholderBase.agents = Object.assign({}, placeholderBase.agents, {
+  worker: { autonomy: 'auto', may_dispatch_to: ['*'], max_open_from_agents: 100, max_concurrent: 5 },
+});
+fs.writeFileSync(placeholderPolicy, JSON.stringify(placeholderBase));
+process.env.BUS_POLICY_PATH = placeholderPolicy;
 const db = S.openDb(path.join(temp, 'test.db'));
 try {
   S.setRuntimeState(db, 'human', true);
@@ -39,7 +50,7 @@ try {
     const task = S.createTask(db, { title: 'sensitive', project: temp, status: 'open', target: 'worker', grants: ['fs:delete'] });
     const claimed = S.claim(db, 'worker', task.id);
     assert.equal(claimed.ok, true);
-    const issued = S.issueExecutionGrant(db, task.id, 'worker', { task_version: claimed.task.version });
+    const issued = S.issueExecutionGrant(db, task.id, 'worker', { task_version: claimed.task.version, probe: VALID_PROBE });
     assert.equal(issued.ok, true, JSON.stringify(issued));
     const result = Codex.admitTask(S, db, task, 'worker', engine, issued.grant);
     assert.equal(result.reason, 'engine_isolation_unsupported');

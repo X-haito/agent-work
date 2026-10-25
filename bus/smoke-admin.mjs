@@ -65,7 +65,14 @@ ok('覆盖策略前创建备份', saved2.backup && fs.existsSync(saved2.backup))
 
 console.log('\n[2b] 策略开关渲染与保存请求');
 const { renderConsole } = await import('./board-ui.mjs');
-const policyScript = renderConsole({ csrf: 'test', actor: 'human' }).split('<script>')[1].split('</script>')[0];
+// 第 14 项第 2 阶段：脚本抽到了 bus/ui/app.js。这里断言的是 UI 逻辑本身，
+// 所以用 inlineAssets 渲染（内容与 app.js 逐字节一致，smoke-ui-static 负责守护这一点）。
+const policyScript = renderConsole({ csrf: 'test', actor: 'human', inlineAssets: true }).split('<script>')[1].split('</script>')[0];
+// 第 14 项第 3 阶段：线上代码是 bus/ui/ 下的 ES module；app.js 已冻结为回滚快照。
+// 这里断言的是**活的**实现，所以拼的是 views/state/dom 模块源码。
+const uiModuleFiles = ['main.mjs', 'state.mjs', 'api.mjs', 'components/dom.mjs', 'views/overview.mjs', 'views/tasks.mjs', 'views/projects.mjs', 'views/settings.mjs', 'views/reports.mjs'];
+const appJsSource = uiModuleFiles.map(function (f) { return fs.readFileSync(path.join(S.BUS_DIR, 'ui', f), 'utf8'); }).join('\n');
+const frozenUiSource = fs.readFileSync(path.join(S.BUS_DIR, 'ui', 'app.js'), 'utf8');
 const nodes = new Map();
 function policyNode(selector) { if (!nodes.has(selector)) nodes.set(selector, { value: '', checked: false, innerHTML: '' }); return nodes.get(selector); }
 let savedPolicyBody;
@@ -210,7 +217,12 @@ const home = await fetch(apiUrl + '/');
 const html = await home.text();
 ok('控制台页面可渲染', home.status === 200 && html.includes('任务台账'));
 ok('报告过滤与启停退出入口完整', ['report-project', 'report-status', 'report-owner', 'bus-toggle', 'console-shutdown'].every(function (x) { return html.includes(x); }));
-try { new Function(html.split('<script>')[1].split('</script>')[0]); ok('完整浏览器脚本语法通过', true); } catch (e) { ok('完整浏览器脚本语法通过', false, e.message); }
+try { new Function(frozenUiSource); ok('冻结回滚快照 app.js 语法通过', true); } catch (e) { ok('冻结回滚快照 app.js 语法通过', false, e.message); }
+try {
+  const mods = ['state.mjs', 'api.mjs', 'components/dom.mjs', 'components/dialog.mjs', 'views/overview.mjs', 'views/tasks.mjs', 'views/projects.mjs', 'views/settings.mjs', 'views/reports.mjs', 'main.mjs'];
+  await Promise.all(mods.map(function (m) { return import('./ui/' + m); }));
+  ok('ES module 整棵可加载（Node 里 import 全过）', true);
+} catch (e) { ok('ES module 整棵可加载（Node 里 import 全过）', false, e.message); }
 ok('新库默认关闭但 Human 看板可访问', (await (await fetch(apiUrl + '/api/bus/status')).json()).enabled === false);
 const denied = await fetch('http://127.0.0.1:' + port + '/api/tasks', {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'x' }),
@@ -302,9 +314,181 @@ if (typeof S.costByProject === 'function') {
 } else {
   ok('项目聚合函数不存在时不伪造数据', costProjects === null);
 }
-ok('总览项目区与台账项目筛选入口存在', html.includes('id="project-cost" hidden') && html.includes('未分配（无任务）') && html.includes('id="task-project"'));
+ok('总览项目区与台账项目筛选入口存在',
+  html.includes('id="project-cost" hidden') && html.includes('id="task-project"') && appJsSource.includes('未分配（无任务）'),
+  { markup: html.includes('id="project-cost" hidden'), script: appJsSource.includes('未分配（无任务）') });
+
+// [6c] 归档概况与"归档前后数字一致"：数字只能来自 store 的合并口径，console-server 不许自己聚合。
+console.log('\n[6c] 归档概况与归档前后一致');
+ok('state 始终暴露 archive 字段（数据层未就绪时为 null）', Object.prototype.hasOwnProperty.call(costState, 'archive'), Object.keys(costState));
+ok('cost 数字与 store.costSummary 完全一致（看板不自己聚合）',
+  typeof S.costSummary === 'function' && costState.cost.total === S.costSummary(apiDb, base.lead).total,
+  { board: costState.cost.total, store: (S.costSummary(apiDb, base.lead) || {}).total });
+if (typeof S.costByProject === 'function') {
+  ok('cost_by_project 与 store.costByProject 完全一致',
+    costState.cost_by_project.total.total === S.costByProject(apiDb, base.lead).total.total,
+    { board: costState.cost_by_project.total.total, store: S.costByProject(apiDb, base.lead).total.total });
+}
+if (typeof S.archiveStatus !== 'function') {
+  ok('数据层未就绪时 archive 为 null 而不是编造数字', costState.archive === null, costState.archive);
+} else {
+  const status = costState.archive;
+  ok('state.archive 暴露最近归档时间、daily/归档行数与待清理候选',
+    !!status && Object.prototype.hasOwnProperty.call(status, 'last_archived_at') &&
+    Number.isInteger(status.token_usage_daily_rows) && Number.isInteger(status.task_archives_rows) &&
+    !!status.pending_candidates && ['messages', 'guard_events', 'token_usage', 'logs'].every(k => Number.isInteger(status.pending_candidates[k])),
+    status);
+}
+if (typeof S.getTaskArchive !== 'function') {
+  const probe = await (await fetch(apiUrl + '/api/tasks/' + encodeURIComponent(reviewTask.id) + '/archive')).json();
+  ok('数据层未就绪时归档接口明确 unavailable 而不编造', probe.available === false && probe.archive === null, probe);
+} else {
+  // 夹具：直接写一行 task_archives，验证"已归档任务按需返回 path 与 hash"这条链路是真的通的。
+  apiDb.prepare('INSERT OR REPLACE INTO task_archives(task_id,archive_path,archived_at,sha256,bytes) VALUES(?,?,?,?,?)')
+    .run(reviewTask.id, 'bus/logs/archive/' + reviewTask.id + '.jsonl', new Date().toISOString(), 'f'.repeat(64), 1234);
+  const archived = await (await fetch(apiUrl + '/api/tasks/' + encodeURIComponent(reviewTask.id) + '/archive')).json();
+  ok('已归档任务的详情能拿到 archive path / hash / 字节数',
+    archived.available === true && !!archived.archive && /\.jsonl$/.test(archived.archive.archive_path) &&
+    String(archived.archive.sha256).length === 64 && archived.archive.bytes === 1234, archived.archive);
+  apiDb.prepare('DELETE FROM task_archives WHERE task_id=?').run(reviewTask.id);
+  const cleared = await (await fetch(apiUrl + '/api/tasks/' + encodeURIComponent(reviewTask.id) + '/archive')).json();
+  ok('未归档任务的详情返回 archive=null（不显示归档行）', cleared.available === true && cleared.archive === null, cleared);
+}
+ok('看板含归档面板与「归档前后数字一致」说明',
+  html.includes('id="archive-summary"') && html.includes('id="tf-archive-row"') &&
+  appJsSource.includes('renderArchiveSummary') && appJsSource.includes('loadTaskArchive') &&
+  appJsSource.includes('归档前后数字一致'),
+  { markup: html.includes('id="archive-summary"'), render: appJsSource.includes('renderArchiveSummary') });
+ok('外链模式下页面没有内联脚本/样式，只引用带版本号的静态资源（module 入口 + 外链 CSS）',
+  html.indexOf('<script>') < 0 && html.indexOf('<style>') < 0 &&
+  /<script type="module" src="\/ui\/main\.mjs\?v=[0-9a-f]{12}"><\/script>/.test(html) && /\/ui\/styles\.css\?v=[0-9a-f]{12}/.test(html),
+  html.slice(0, 200));
+if (typeof S.archiveStatus !== 'function') {
+  console.log('  SKIP  归档前后成本一致性 :: store.archiveStatus 未就绪（第 10 项数据层由并行任务实现）');
+} else {
+  const rollDb = S.openDb(path.join(dir, 'archive-consistency.db'));
+  try {
+    S.setRuntimeState(rollDb, 'human', true);
+    const rollTask = S.createTask(rollDb, { title: 'rollup', project: 'demo', status: 'open', target: 'worker' });
+    S.recordUsage(rollDb, 'worker', rollTask.id, 'execute', 300, 120);
+    S.recordUsage(rollDb, 'worker', rollTask.id, 'review', 40, 10);
+    const beforeCost = S.costSummary(rollDb, base.lead);
+    const beforeProject = typeof S.costByProject === 'function' ? S.costByProject(rollDb, base.lead) : null;
+    // 模拟 archive.mjs 的聚合：raw 用量按主键范围汇总进 daily，再在同一事务删掉 raw。
+    rollDb.prepare('INSERT INTO token_usage_daily(day_key,agent,project,task_id,tokens_in,tokens_out) ' +
+      'SELECT substr(ts,1,10),agent,(SELECT project FROM tasks WHERE id=token_usage.task_id),task_id,SUM(tokens_in),SUM(tokens_out) ' +
+      'FROM token_usage GROUP BY substr(ts,1,10),agent,task_id').run();
+    const dailyRows = Number(rollDb.prepare('SELECT COUNT(*) AS n FROM token_usage_daily').get().n);
+    rollDb.prepare('DELETE FROM token_usage').run();
+    const afterCost = S.costSummary(rollDb, base.lead);
+    const afterProject = typeof S.costByProject === 'function' ? S.costByProject(rollDb, base.lead) : null;
+    ok('聚合真的落进 token_usage_daily', dailyRows > 0, dailyRows);
+    ok('归档前后 costSummary 完全一致（daily + raw 去重合并）',
+      beforeCost.total === afterCost.total && JSON.stringify(beforeCost.by_agent) === JSON.stringify(afterCost.by_agent),
+      { before: beforeCost.total, after: afterCost.total });
+    if (beforeProject) ok('归档前后 costByProject 完全一致', beforeProject.total.total === afterProject.total.total, { before: beforeProject.total.total, after: afterProject.total.total });
+    const rollStatus = S.archiveStatus(rollDb, S.loadPolicy());
+    ok('archiveStatus 字段齐全且待清理候选是轻量计数',
+      !!rollStatus && Object.prototype.hasOwnProperty.call(rollStatus, 'last_archived_at') &&
+      typeof rollStatus.token_usage_daily_rows === 'number' && typeof rollStatus.task_archives_rows === 'number' &&
+      !!rollStatus.pending_candidates && ['messages', 'guard_events', 'token_usage', 'logs'].every(k => typeof rollStatus.pending_candidates[k] === 'number'),
+      rollStatus);
+  } finally { try { rollDb.close(); } catch (e) {} }
+}
 
 
+
+console.log('\n[6d] 归档面板前端逻辑（vm 抽真源码 + DOM 桩）');
+{
+  const vm = await import('node:vm');
+  // 第 14 项第 2 阶段：这些渲染函数已经搬到 bus/ui/app.js，切片来源随之改变（顺序断言在 smoke-ui-static 里）。
+  const uiSource = appJsSource;
+  function extractFn(source, name) {
+  const patterns = ['function ' + name + '(', 'async function ' + name + '('];
+  let start = -1;
+  for (const p of patterns) { const i = source.indexOf(p); if (i >= 0 && (start < 0 || i < start)) start = i; }
+  if (start < 0) return '';
+  let depth = 0, i = source.indexOf('{', start);
+  for (; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return source.slice(start, i + 1); }
+  }
+  return '';
+}
+function sliceFn(source, header, tail) {
+    const start = source.indexOf(header);
+    const end = source.indexOf(tail, start);
+    return source.slice(start, end);
+  }
+  const panelBody = extractFn(uiSource, 'renderArchiveSummary');
+  const boxes = {};
+  const panelCtx = {
+    state: { archive: null },
+    q: sel => (boxes[sel] = boxes[sel] || { hidden: false, innerHTML: '' }),
+    esc: v => String(v), num: v => String(v), fmt: v => String(v),
+    // dash 是同一段脚本里的兄弟函数，抽单个函数时得补进上下文（和 supervisor 的抽取手法一致）。
+    dash: v => (v == null ? '—' : String(v)),
+  };
+  const renderPanel = vm.runInNewContext('(' + panelBody.trim() + ')', panelCtx);
+  renderPanel();
+  ok('archive 为空时面板隐藏且不渲染内容', boxes['#archive-summary'].hidden === true && boxes['#archive-summary'].innerHTML === '');
+  panelCtx.state.archive = {
+    last_archived_at: '2026-05-01T00:00:00.000Z', token_usage_daily_rows: 12, task_archives_rows: 3,
+    pending_candidates: { messages: 5, guard_events: 2, token_usage: 7, logs: 1 },
+  };
+  renderPanel();
+  const panelHtml = boxes['#archive-summary'].innerHTML;
+  ok('archive 有数据时面板显示四类计数与归档时间',
+    boxes['#archive-summary'].hidden === false && panelHtml.includes('2026-05-01') && panelHtml.includes('12') &&
+    panelHtml.includes('3') && /消息 5/.test(panelHtml) && /守卫事件 2/.test(panelHtml) && /原始 Token 用量 7/.test(panelHtml) && /日志文件 1/.test(panelHtml), panelHtml.slice(0, 300));
+  ok('面板写明「归档前后数字一致」与日志删除条件',
+    panelHtml.includes('归档前后数字一致') && panelHtml.includes('哈希'));
+  panelCtx.state.archive = { last_archived_at: null, token_usage_daily_rows: null, task_archives_rows: null, pending_candidates: null };
+  renderPanel();
+  ok('缺字段时用「—」占位而不是编 0', /—/.test(boxes['#archive-summary'].innerHTML) && !/消息 0/.test(boxes['#archive-summary'].innerHTML), boxes['#archive-summary'].innerHTML.slice(0, 200));
+
+  // 第 48 项：孤儿过期行（无归档凭据）默认不删，看板必须把计数与「永不删除」说清楚
+  panelCtx.state.archive = {
+    last_archived_at: '2026-05-01T00:00:00.000Z', token_usage_daily_rows: 12, task_archives_rows: 3,
+    pending_candidates: { messages: 5, guard_events: 2, token_usage: 7, logs: 1 },
+    unmanaged: { messages: 4, guard_events: 1, deferred_messages: 3, deferred_guard_events: 0, prune_unmanaged: false },
+  };
+  renderPanel();
+  const orphanHtml = boxes['#archive-summary'].innerHTML;
+  ok('看板显示孤儿行计数（消息/守卫事件/等待归档）',
+    orphanHtml.includes('不可归属的过期行') && /孤儿消息 4 条/.test(orphanHtml) && /孤儿守卫事件 1 条/.test(orphanHtml) &&
+    /等待所属任务归档 3 条消息/.test(orphanHtml), orphanHtml.slice(0, 400));
+  ok('看板写明孤儿行默认「永不删除」', orphanHtml.includes('永不删除') && !orphanHtml.includes('允许删除'), orphanHtml.slice(-260));
+  ok('孤儿行小节不产生 undefined/NaN', !/undefined|NaN|\[object/.test(orphanHtml), orphanHtml.slice(0, 200));
+  panelCtx.state.archive = {
+    last_archived_at: null, token_usage_daily_rows: 0, task_archives_rows: 0,
+    pending_candidates: { messages: 0, guard_events: 0, token_usage: 0, logs: 0 },
+    unmanaged: { messages: 2, guard_events: 0, deferred_messages: 1, deferred_guard_events: 0, prune_unmanaged: true },
+  };
+  renderPanel();
+  ok('prune_unmanaged=1 时看板改口为「允许删除」并说明没有 JSONL 凭据',
+    /允许删除孤儿行/.test(boxes['#archive-summary'].innerHTML) && boxes['#archive-summary'].innerHTML.includes('JSONL'), boxes['#archive-summary'].innerHTML.slice(-260));
+  panelCtx.state.archive = { last_archived_at: null, token_usage_daily_rows: 0, task_archives_rows: 0, pending_candidates: { messages: 0, guard_events: 0, token_usage: 0, logs: 0 }, unmanaged: null };
+  renderPanel();
+  ok('unmanaged 为 null（老服务端/算不出来）时整节隐藏且不编 0',
+    !boxes['#archive-summary'].innerHTML.includes('不可归属') && !/孤儿消息 0/.test(boxes['#archive-summary'].innerHTML), boxes['#archive-summary'].innerHTML.slice(0, 240));
+
+  const archiveRow = { hidden: false, textContent: '' };
+  const archiveBox = { hidden: false, textContent: '' };
+  const loadCtx = {
+    q: sel => (sel === '#tf-archive-row' ? archiveRow : archiveBox),
+    api: async () => ({ available: true, archive: { archive_path: 'bus/logs/archive/t-0001.jsonl', archived_at: '2026-05-01T00:00:00.000Z', sha256: 'f'.repeat(64) } }),
+  };
+  const loadArchive = vm.runInNewContext('(' + extractFn(uiSource, 'loadTaskArchive').trim() + ')', loadCtx);
+  await loadArchive({ id: 't-0001' });
+  ok('已归档任务详情显示 archive path 与「主体已归档，证据摘要保留」',
+    archiveRow.hidden === false && archiveBox.textContent.includes('主体已归档，证据摘要保留') &&
+    archiveBox.textContent.includes('bus/logs/archive/t-0001.jsonl') && archiveBox.textContent.includes('sha256'), archiveBox.textContent);
+  loadCtx.api = async () => ({ available: true, archive: null });
+  await loadArchive({ id: 't-0002' });
+  ok('未归档任务详情隐藏归档行', archiveRow.hidden === true && archiveBox.textContent === '');
+}
 
 console.log('项目管理 API');
 const originalRegistry = fs.readFileSync(path.join(S.BUS_DIR, 'projects.json'), 'utf8');
@@ -412,17 +596,35 @@ ok('Agent自由命令拒绝原因透传',legacyAgent.status===409&&(await legacy
 const agentSave=await fetch(agentUrl+'/api/projects/registered-ui/validators',{method:'PUT',headers:agentHeaders,body:JSON.stringify({validators:{}})});
 ok('Agent不能编辑项目验证器',agentSave.status===403);
 await new Promise(resolve=>agentValidatorServer.close(resolve));
-ok('任务表单为验证器选择并提示先配置',html.includes('<select id="tf-verify">')&&!html.includes('<input id="tf-verify"')&&html.includes('此项目没有验证器，请先到项目页配置'));
+ok('任务表单为验证器选择并提示先配置',html.includes('<select id="tf-verify">')&&!html.includes('<input id="tf-verify"')&&appJsSource.includes('此项目没有验证器，请先到项目页配置'));
 console.log('策略字段生效登记');
 const registryState = await (await fetch(apiUrl + '/api/state')).json();
 if (registryState.policy_registry) {
   const registry = registryState.policy_registry;
   ok('state透出策略字段登记', Array.isArray(registry) && registry.length > 0 && registry.every(f=>f.path&&f.stage&&f.status&&f.owner));
-  ok('planned条目明确第7/8/9项归属', ['global.max_chain_len','economics.max_rounds_per_task','economics.daily_token_budget','economics.peer_review','economics.lead_review'].every(p=>registry.some(f=>f.path===p&&f.status==='planned'&&/^item-[789]$/.test(f.owner))));
+  // 第 7/8/9/11 项都已接线：不再有 planned 字段，各字段归属必须写清。
+  ok('第7/8/9/11项字段均为enforced且归属明确、注册表已无planned条目',
+    ['global.max_chain_len','economics.max_rounds_per_task'].every(p=>registry.some(f=>f.path===p&&f.status==='enforced'&&f.owner==='item-7')) &&
+    ['economics.daily_token_budget'].every(p=>registry.some(f=>f.path===p&&f.status==='enforced'&&f.owner==='item-8')) &&
+    ['economics.peer_review','economics.lead_review'].every(p=>registry.some(f=>f.path===p&&f.status==='enforced'&&f.owner==='item-9')) &&
+    ['permissions.merge'].every(p=>registry.some(f=>f.path===p&&f.status==='enforced'&&f.owner==='item-11')) &&
+    registry.every(f=>f.status==='enforced'));
   policyContext.state.policy_registry=registry;
   vm.runInContext(policyScript.split(String.fromCharCode(10)).find(line=>line.trim().startsWith('function policyEffect(')),policyContext);
-  const plannedMarkup=vm.runInContext("policyEffect('global.max_chain_len')",policyContext);
-  ok('planned字段醒目标注阶段及待第N项接线', plannedMarkup.includes('policy-effect planned')&&plannedMarkup.includes('阶段')&&plannedMarkup.includes('待第 7 项接线'));
+  const wiredMarkup=vm.runInContext("policyEffect('global.max_chain_len')",policyContext);
+  ok('已接线字段显示已生效且不再标注待第7项接线', wiredMarkup.includes('policy-effect enforced')&&wiredMarkup.includes('阶段')&&wiredMarkup.includes('已生效')&&!wiredMarkup.includes('待第 7 项接线'));
+  const budgetMarkup=vm.runInContext("policyEffect('economics.daily_token_budget')",policyContext);
+  ok('item-8 日预算已接线显示已生效', budgetMarkup.includes('policy-effect enforced')&&budgetMarkup.includes('已生效')&&!budgetMarkup.includes('待第 8 项接线'));
+  const reviewMarkup=vm.runInContext("policyEffect('economics.peer_review')",policyContext);
+  ok('item-9 评审路由已接线显示已生效', reviewMarkup.includes('policy-effect enforced')&&reviewMarkup.includes('已生效')&&!reviewMarkup.includes('待第 9 项接线'));
+  const mergeMarkup=vm.runInContext("policyEffect('permissions.merge')",policyContext);
+  ok('item-11 合并权限已接线显示已生效', mergeMarkup.includes('policy-effect enforced')&&mergeMarkup.includes('已生效')&&!mergeMarkup.includes('待第'));
+  // 真实注册表已经没有 planned 条目了，但「planned 必须醒目标注待第 N 项接线」这条机制仍要覆盖：
+  // 用一条合成字段验证 policyEffect 的渲染分支，而不是靠真实字段假装还在待接线。
+  policyContext.state.policy_registry=registry.concat([{ path:'demo.future_field', stage:'dispatch', status:'planned', owner:'item-12', note:'将来才接线' }]);
+  const plannedMarkup=vm.runInContext("policyEffect('demo.future_field')",policyContext);
+  ok('planned 字段仍醒目标注阶段与「待第 N 项接线」', plannedMarkup.includes('policy-effect planned')&&plannedMarkup.includes('阶段')&&plannedMarkup.includes('待第 12 项接线'));
+  policyContext.state.policy_registry=registry;
   const enforcedMarkup=vm.runInContext("policyEffect('economics.report_no_raw_diff')",policyContext);
   ok('enforced字段显示实际生效阶段',enforcedMarkup.includes('报告阶段')&&enforcedMarkup.includes('已生效'));
   policyContext.state.policy_registry=null;
@@ -576,11 +778,16 @@ if (process.argv.includes('--browser')) {
     '    expect(page.locator("[data-e=lead_plans_once]")).to_have_count(0)',
     '    registry = page.request.get(sys.argv[1] + "/api/state").json().get("policy_registry")',
     '    if registry:',
-    '        for policy_path in ["global.max_chain_len", "economics.max_rounds_per_task", "economics.daily_token_budget", "economics.peer_review", "economics.lead_review"]:',
+    '        for policy_path in []:',
     '            marker = page.locator("[data-policy-path=" + chr(34) + policy_path + chr(34) + "]")',
     '            expect(marker).to_be_visible()',
     '            expect(marker).to_contain_text("待第")',
     '            expect(marker).to_have_class("policy-effect planned")',
+    '        for policy_path in ["global.max_chain_len", "economics.max_rounds_per_task", "economics.daily_token_budget", "economics.peer_review", "economics.lead_review", "permissions.merge"]:',
+    '            marker = page.locator("[data-policy-path=" + chr(34) + policy_path + chr(34) + "]")',
+    '            expect(marker).to_be_visible()',
+    '            expect(marker).to_contain_text("已生效")',
+    '            expect(marker).to_have_class("policy-effect enforced")',
     '        expect(page.locator("[data-policy-path=" + chr(34) + "economics.report_no_raw_diff" + chr(34) + "]")).to_contain_text("已生效")',
     '        page.screenshot(path=sys.argv[2] + "/policy-runtime-registry.png", full_page=True)',
     '    verify_switch = page.locator("[data-e=require_verify_cmd]")',
@@ -721,7 +928,7 @@ const collectedGrants = vm.runInContext('collectNetworkGrants()', grantContext);
 ok('任务表单把用户填写的网络目标提交为 network_grants（空行忽略）', JSON.stringify(collectedGrants) === '[{"protocol":"http","host":"API.Example.com","ports":[80,8080],"purpose":"内网只读"}]', collectedGrants);
 const networkEditorIds = ['policy-network', 'network-default', 'network-services', 'network-add-service', 'tf-network-grants', 'tf-network-empty', 'tf-add-network-grant'];
 ok('策略页与任务表单都有网络编辑器入口', networkEditorIds.every(function (id) { return html.includes('id="' + id + '"'); }));
-ok('浏览器脚本含网络编辑器逻辑', ['renderNetworkServices', 'collectNetworkPolicy', 'renderNetworkGrants', 'collectNetworkGrants'].every(function (name) { return html.includes('function ' + name + '('); }));
+ok('浏览器脚本含网络编辑器逻辑', ['renderNetworkServices', 'collectNetworkPolicy', 'renderNetworkGrants', 'collectNetworkGrants'].every(function (name) { return appJsSource.includes('function ' + name + '('); }));
 ok('网络编辑器明示只审计、无法强制隔离', html.includes('无法强制隔离'));
 
 console.log('\n[8] 退出看板不影响总线 / Worker');

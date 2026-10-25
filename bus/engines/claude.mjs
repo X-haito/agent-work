@@ -1,13 +1,20 @@
 import { checkGrant, requiresStrongIsolation, launch } from './codex.mjs';
-// networkIsolation=false：claude 子进程可以无视 HTTP_PROXY/HTTPS_PROXY 直接建连，
-// 所以联网任务只能审计，无法强制，必须转 proposed + needs_human。
-export function capabilities() {
-  return {
-    strongWriteIsolation: false,
+import * as Isolation from '../isolation/provider.mjs';
+
+// 能力由 probe 推导，不自述（第 3 项第 9 条）。受限 permission-mode 不是 OS 强写隔离，
+// 本机也没有可用容器运行时 → 两个隔离能力都是 false。
+export function capabilities(options = {}) {
+  const isolated = Isolation.resolveCapability(options);
+  return Object.assign({}, isolated.capability, {
+    engine: 'claude',
     supportsAddDir: true,
-    networkIsolation: false,
-    notes: ['受限 permission-mode 不是 OS 强写隔离', 'networkIsolation=false：只能注入 HTTP(S)_PROXY 做审计，无法阻止 claude 子进程绕过代理直连'],
-  };
+    mechanisms: ['受限 permission-mode + --add-dir（不是 OS 级写隔离）'],
+    notes: (isolated.probe.notes || []).concat([
+      'strongWriteIsolation / networkIsolation 由 probe 推导，adapter 不自述',
+      '受限 permission-mode 不是 OS 强写隔离',
+      'networkIsolation=false：只能注入 HTTP(S)_PROXY 做审计，无法阻止 claude 子进程绕过代理直连',
+    ]),
+  });
 }
 export function planArgs(grant, prompt, opts = {}) {
   const roots = checkGrant(grant);

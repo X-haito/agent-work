@@ -11,9 +11,14 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-runtime-'));
 const dbFile = path.join(tmp, 'bus.db');
 const policyFile = path.join(tmp, 'policy.json');
+// 派活来源与认领者都必须在 agents 里登记（unknown_agent 硬拒）。
 const policy = { lead: 'lead', permissions: { dispatch: ['lead'], accept: ['human','lead'] },
-  global: {}, economics: {}, agents: { worker: { autonomy: 'auto', max_open_from_agents: 10 } } };
+  global: {}, economics: {},
+  agents: { lead: { autonomy: 'auto', may_dispatch_to: ['worker'], max_open_from_agents: 10, max_concurrent: 5 },
+    worker: { autonomy: 'auto', max_open_from_agents: 10, max_concurrent: 5 } } };
 fs.writeFileSync(policyFile, JSON.stringify(policy));
+// 父进程自己的 claim/dispatch 也走这份临时策略：否则 claim 读真实 policy，占位 actor 会被判 unknown_agent。
+process.env.BUS_POLICY_PATH = policyFile;
 let db = S.openDb(dbFile);
 let checks = 0;
 function check(name, fn) { fn(); checks++; console.log('PASS ' + name); }

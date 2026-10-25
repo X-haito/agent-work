@@ -1,0 +1,8 @@
+
+    html{background:#0d1117;color:#c9d1d9;font:15px/1.7 "Segoe UI","Microsoft YaHei",sans-serif}
+    body{margin:0;min-height:100vh;display:grid;place-items:center;padding:32px}
+    .card{max-width:560px;border:1px solid #2a3646;border-radius:16px;padding:30px 32px;background:#131b26;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+    h1{font-size:19px;margin:0 0 14px;color:#e6edf3}
+    p{margin:0 0 12px;color:#9aa7b6}
+    code{background:#1d2836;border-radius:6px;padding:2px 7px;font-family:Consolas,monospace;font-size:13px;color:#9ecbff}
+  

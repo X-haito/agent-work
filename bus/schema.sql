@@ -1,6 +1,28 @@
 -- Agent Bus schema. 由 store.mjs 在每次启动时执行，须保持幂等。
 PRAGMA journal_mode = WAL;
 
+-- 第 12 项第 5 条：迁移版本台账。(version,checksum) 是"这份库跑过哪些步骤"的唯一凭据：
+-- checksum 与代码里的步骤定义不匹配时 migrations.mjs 立即停止，且停止前不做任何 DDL。
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version    INTEGER PRIMARY KEY,
+  name       TEXT NOT NULL,
+  applied_at TEXT NOT NULL,
+  checksum   TEXT NOT NULL
+);
+
+-- 第 15 项第 4 条：项目迁移台账（adopt 的唯一凭据；与 tasks.project 更新同一事务）
+CREATE TABLE IF NOT EXISTS project_migrations (
+  migration_id   TEXT PRIMARY KEY,
+  legacy_project TEXT NOT NULL,
+  new_project    TEXT NOT NULL,
+  path           TEXT NOT NULL,
+  tasks_migrated INTEGER NOT NULL DEFAULT 0,
+  actor          TEXT NOT NULL,
+  created_at     TEXT NOT NULL,
+  note           TEXT
+);
+CREATE INDEX IF NOT EXISTS i_project_migrations_legacy ON project_migrations(legacy_project, created_at);
+
 CREATE TABLE IF NOT EXISTS agentbus_runtime_state (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
@@ -23,6 +45,7 @@ CREATE TABLE IF NOT EXISTS messages (
   refs       TEXT,
   reply_to   TEXT,
   hop        INTEGER NOT NULL DEFAULT 0,
+  chain_root TEXT,
   claimed_by TEXT
 );
 CREATE INDEX IF NOT EXISTS i_msg_seq    ON messages(seq);
@@ -40,6 +63,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   target         TEXT,
   depth          INTEGER NOT NULL DEFAULT 0,
   cost_class     TEXT NOT NULL DEFAULT 'standard',
+  token_budget   INTEGER,
   write_scope    TEXT,
   max_subagents  INTEGER NOT NULL DEFAULT 0,
   version        INTEGER NOT NULL DEFAULT 0,
@@ -53,6 +77,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   redline        TEXT,
   grants         TEXT,
   network_grants TEXT,
+  round_count    INTEGER NOT NULL DEFAULT 0,
+  retry_limit    INTEGER,
+  parent_task_id TEXT,
   guard          TEXT,
   changed_files  INTEGER,
   needs_human    INTEGER NOT NULL DEFAULT 0,
@@ -112,6 +139,92 @@ CREATE TABLE IF NOT EXISTS token_usage (
 );
 CREATE INDEX IF NOT EXISTS i_usage_agent ON token_usage(agent, ts);
 
+-- 合并请求（第 11 项）：唯一合法状态机 proposed → approved → merging → merged|failed|cancelled。
+-- 创建需要 permissions.merge；批准只有 human 能做（任务的 accept 权限不能当 merge 权限用）。
+CREATE TABLE IF NOT EXISTS merge_requests (
+  id            TEXT PRIMARY KEY,
+  project       TEXT NOT NULL,
+  task_ids_json TEXT NOT NULL DEFAULT '[]',
+  source_ref    TEXT NOT NULL,
+  target_ref    TEXT NOT NULL DEFAULT 'main',
+  status        TEXT NOT NULL CHECK (status IN ('proposed','approved','merging','merged','failed','cancelled')),
+  requested_by  TEXT NOT NULL,
+  approved_by   TEXT,
+  verify_run_id TEXT,
+  merge_commit  TEXT,
+  version       INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  -- 第 11 项：执行阶段留痕与"发现值变化 → 回到需人工确认"标志（不改 status 的 CHECK 约束，不许重建表）
+  worker_id          TEXT,
+  started_at         TEXT,
+  lease_until        TEXT,
+  approved_preflight TEXT,
+  error              TEXT,
+  log_path           TEXT,
+  log_sha256         TEXT,
+  needs_human        INTEGER NOT NULL DEFAULT 0,
+  needs_human_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS i_merge_status ON merge_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS i_merge_project ON merge_requests(project, status);
+
+-- 归档聚合（第 10 项）：按 (天, agent, project, task) 折叠的用量。
+-- 清理原始 token_usage 前必须先 upsert 到这里并核对总和；查询层合并 daily 与未归档 raw。
+CREATE TABLE IF NOT EXISTS token_usage_daily (
+  day_key     TEXT NOT NULL,
+  agent       TEXT NOT NULL,
+  project     TEXT NOT NULL DEFAULT '',
+  task_id     TEXT NOT NULL DEFAULT '',
+  tokens_in   INTEGER NOT NULL DEFAULT 0,
+  tokens_out  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day_key, agent, project, task_id)
+);
+CREATE INDEX IF NOT EXISTS i_usage_daily_agent ON token_usage_daily(agent, day_key);
+
+-- 已归档任务的快照凭据：JSONL 归档文件的路径、hash 与大小
+CREATE TABLE IF NOT EXISTS task_archives (
+  task_id      TEXT PRIMARY KEY,
+  archive_path TEXT NOT NULL,
+  archived_at  TEXT NOT NULL,
+  sha256       TEXT NOT NULL,
+  bytes        INTEGER NOT NULL
+);
+
+-- 归档单例租约（第 10 项第 14 条）：同一时刻只允许一个 archive 运行；
+-- id 固定为 'archive'，靠主键 + 未过期判定实现"单例"。
+CREATE TABLE IF NOT EXISTS archive_leases (
+  id          TEXT PRIMARY KEY,
+  holder      TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  expires_at  TEXT NOT NULL,
+  note        TEXT
+);
+
+-- 日志引用：只有引用任务已归档且文件 hash 一致时才允许删除
+CREATE TABLE IF NOT EXISTS artifact_refs (
+  task_id       TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  sha256        TEXT,
+  size          INTEGER,
+  PRIMARY KEY (task_id, kind, relative_path)
+);
+
+-- 预留：supervisor 启动模型前先占额度，commit 后释放为实际用量。
+-- 只有 committed_at IS NULL 且 expires_at 未过的行算"占着"（崩溃遗留按过期自动释放）。
+CREATE TABLE IF NOT EXISTS token_reservations (
+  id              TEXT PRIMARY KEY,
+  agent           TEXT NOT NULL,
+  task_id         TEXT,
+  day_key         TEXT NOT NULL,
+  reserved_tokens INTEGER NOT NULL CHECK (reserved_tokens > 0),
+  expires_at      TEXT NOT NULL,
+  committed_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS i_res_day  ON token_reservations(day_key, committed_at);
+CREATE INDEX IF NOT EXISTS i_res_task ON token_reservations(task_id, committed_at);
+
 
 CREATE TABLE IF NOT EXISTS execution_grants (
   grant_id TEXT PRIMARY KEY,
@@ -166,6 +279,26 @@ CREATE TABLE IF NOT EXISTS verification_runs (
 );
 CREATE INDEX IF NOT EXISTS i_verification_task ON verification_runs(task_id,started_at);
 
+-- 评审指派（第 9 项）：同一任务同时只允许一个 active（已认领）评审，由部分唯一索引强制。
+-- pending = 已指派/待认领；它不剥夺 permissions.accept 的最终状态权限，但 active 的 verdict 不可绕过。
+CREATE TABLE IF NOT EXISTS reviews (
+  id           TEXT PRIMARY KEY,
+  task_id      TEXT NOT NULL,
+  reviewer     TEXT,
+  route        TEXT NOT NULL CHECK (route IN ('auto','peer','lead','human')),
+  status       TEXT NOT NULL,
+  task_version INTEGER,
+  verdict      TEXT,
+  summary      TEXT,
+  lease_until  TEXT,
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS i_reviews_active ON reviews(task_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS i_reviews_task     ON reviews(task_id, created_at);
+CREATE INDEX IF NOT EXISTS i_reviews_pending  ON reviews(status, created_at);
+CREATE INDEX IF NOT EXISTS i_reviews_reviewer ON reviews(reviewer, status);
+
 -- 网络判定流水：只记目标与结果，是"谁批准了哪个目标、代理放行了什么"的唯一凭据。
 -- 白名单纪律：Authorization、Cookie、query 与正文永不入库（写入统一走 network-policy.recordEvent）。
 CREATE TABLE IF NOT EXISTS network_events (
@@ -184,15 +317,27 @@ CREATE TABLE IF NOT EXISTS network_events (
 CREATE INDEX IF NOT EXISTS i_net_events_task ON network_events(task_id, ts);
 CREATE INDEX IF NOT EXISTS i_net_events_ts ON network_events(ts);
 
+-- 升级记录：task_id + kind 唯一，是"只升级一次"的唯一凭据（retry_exceeded / chain_limit）。
+CREATE TABLE IF NOT EXISTS task_escalations (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id    TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(task_id, kind)
+);
+CREATE INDEX IF NOT EXISTS i_escalation_kind ON task_escalations(kind, created_at);
+
 CREATE TABLE IF NOT EXISTS agent_credentials (
   agent_id     TEXT NOT NULL,
   token_hash   TEXT NOT NULL PRIMARY KEY,
   created_at   TEXT NOT NULL,
   expires_at   TEXT,
   revoked_at   TEXT,
-  last_used_at TEXT
+  last_used_at TEXT,
+  state        TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('pending','active','revoked'))
 );
 CREATE INDEX IF NOT EXISTS i_cred_agent ON agent_credentials(agent_id, revoked_at);
+CREATE INDEX IF NOT EXISTS i_cred_state ON agent_credentials(agent_id, state);
 
 CREATE TABLE IF NOT EXISTS audit_log (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -11,6 +11,15 @@ export function refTaskId(message) {
   } catch (e) { return null; }
 }
 
+// 上限类事件：任务已到轮次上限，或消息链已到长度上限。
+// 它们是"机器已经判定停手"的信号，只给 Lead 与 Human，绝不能唤醒 worker 再起一圈。
+export const ESCALATION_KINDS = ['retry_exceeded', 'chain_limit'];
+
+export function isEscalationKind(message) {
+  const kind = String((message && message.kind) || '');
+  return ESCALATION_KINDS.indexOf(kind) >= 0;
+}
+
 function isThreadRecipient(value) {
   return typeof value === 'string' && value.indexOf('thread:') === 0;
 }
@@ -22,6 +31,10 @@ export function isRelevantMessage(message, context) {
   const isLead = ctx.isLead === true;
   const mine = ctx.mine instanceof Set ? ctx.mine : new Set(ctx.mine || []);
   const getTask = typeof ctx.getTask === 'function' ? ctx.getTask : function () { return null; };
+
+  // 升级事件先判：它们的 recipient 可能写着 worker、thread 也可能正是 worker 自己的任务，
+  // 走到下面的分支就会被当成"点名给我"而白起一次模型回合。Lead 永远要看到，worker 永远不。
+  if (isEscalationKind(m)) return isLead;
 
   // Direct messages are for exactly one node. task.new to a Worker is useful only
   // while the referenced card is actually open; proposed/stale cards must not wake it.

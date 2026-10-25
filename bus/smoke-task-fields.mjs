@@ -54,7 +54,7 @@ try{
     const r=JSON.parse(replies.get(3).result.content[0].text);assert.equal(r.task.status,'proposed');assert.deepEqual(r.task.extra_dirs,['relative/path']);assert.equal(replies.get(4).result.isError,true);
   });
   await check('MCP task listings return structured extra directories and authorization arrays',()=>{
-    const tasks=JSON.parse(replies.get(5).result.content[0].text).tasks;
+    const tasks=JSON.parse(replies.get(5).result.content[0].text).items;
     const task=tasks.find(t=>t.title==='MCP directories');assert.deepEqual(task.extra_dirs,['relative/path']);assert(Array.isArray(task.redline));assert(Array.isArray(task.grants));assert.equal(typeof task.verify_cmd,'string');
   });
   await check('MCP Agent free command is rejected with legacy reason',()=>{

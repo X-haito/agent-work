@@ -16,9 +16,23 @@ const actualRegistry = path.join(BUS_DIR, 'projects.json');
 const actualSnapshot = fs.readFileSync(actualRegistry, 'utf8');
 try {
   fs.mkdirSync(bus);
-  for (const file of ['store.mjs', 'schema.sql', 'redline.mjs', 'migrations.mjs', 'execution-grant.mjs', 'verifier.mjs']) {
-    fs.copyFileSync(path.join(BUS_DIR, file), path.join(bus, file));
+  // 隔离夹具：动态镜像 bus/ 下所有 *.mjs 与 *.sql（含子目录、排除 smoke*.mjs），
+  // 不再维护硬编码清单 —— 那已经四次因为 store 新增静态依赖而让整套挂掉
+  // （migrations.mjs / verifier.mjs / review-routing.mjs / auth.mjs）。
+  function mirror(source, target) {
+    for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+      if (/^smoke.*.mjs$/.test(entry.name)) continue;
+      const from = path.join(source, entry.name);
+      const to = path.join(target, entry.name);
+      if (entry.isDirectory()) {
+        fs.mkdirSync(to, { recursive: true });
+        mirror(from, to);
+      } else if (/.(mjs|sql)$/.test(entry.name)) {
+        fs.copyFileSync(from, to);
+      }
+    }
   }
+  mirror(BUS_DIR, bus);
   const S = await import(pathToFileURL(path.join(bus, 'store.mjs')).href);
   check('missing registry reads empty without creating files', () => {
     assert.deepEqual(A.readProjectsRegistry(options), { projects: {} });

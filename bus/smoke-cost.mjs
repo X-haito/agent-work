@@ -9,8 +9,11 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-cost-'));
 const db = S.openDb(path.join(tmp, 'bus.db'));
 let pass = 0;
 function check(name, fn) { fn(); pass++; console.log('PASS ' + name); }
+// 派活来源必须在 agents 里登记（unknown_agent 硬拒），否则 dispatch 会被当成未知身份。
 const policy = { lead: 'lead', global: {}, permissions: { dispatch: ['lead'] },
-  economics: { auto_accept: ['trivial'] }, agents: { worker: { autonomy: 'auto', max_open_from_agents: 100 } } };
+  economics: { auto_accept: ['trivial'] },
+  agents: { lead: { autonomy: 'auto', may_dispatch_to: ['worker'], max_open_from_agents: 100, max_concurrent: 5 },
+    worker: { autonomy: 'auto', max_open_from_agents: 100 } } };
 try {
   check('empty database reports finite zero totals and ratios', () => {
     assert.deepEqual(S.costByProject(db, 'lead'), {

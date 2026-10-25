@@ -2,6 +2,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import * as Iso from './isolation/provider.mjs';
+// 强隔离类 grant 必须有有效 probe（第 3 项第 10 条）。测试里必须给真 probe，
+// 不能把闸门测宽松成 probe_missing——那等于把刚建的闸门测没了。
+const VALID_PROBE = { provider: 'container', probe_version: Iso.PROBE_VERSION, verified: true, write_inside: true, write_outside: false, network_direct: false, network_via_proxy: true, tested_at: new Date().toISOString(), reason: 'verified' };
 import { DatabaseSync } from 'node:sqlite';
 import * as S from './store.mjs';
 import { normalizeRoots } from './execution-grant.mjs';
@@ -12,6 +16,15 @@ const outside = path.join(tmp, 'outside');
 fs.mkdirSync(project); fs.mkdirSync(outside);
 fs.writeFileSync(path.join(project, 'project.json'), JSON.stringify({ topology:'shared' }));
 const dbFile = path.join(tmp, 'bus.db');
+// unknown_agent 现在是硬拒：占位 actor 必须登记进**本套件自己的临时策略**（真实 policy 打底，不设任何白名单后门）。
+const placeholderPolicy = path.join(tmp, 'policy-placeholder.json');
+const placeholderBase = JSON.parse(fs.readFileSync(path.join(S.BUS_DIR, 'policy.json'), 'utf8'));
+placeholderBase.agents = Object.assign({}, placeholderBase.agents, {
+  'worker/main': { autonomy: 'auto', may_dispatch_to: ['*'], max_open_from_agents: 100, max_concurrent: 5 },
+  'other/main': { autonomy: 'auto', may_dispatch_to: ['*'], max_open_from_agents: 100, max_concurrent: 5 },
+});
+fs.writeFileSync(placeholderPolicy, JSON.stringify(placeholderBase));
+process.env.BUS_POLICY_PATH = placeholderPolicy;
 let db = S.openDb(dbFile);
 S.setRuntimeState(db, 'human', true);
 const policy = { permissions: { reassign: ['human'], accept: ['human'] } };
@@ -30,11 +43,11 @@ try {
   });
   check('claimed task issues canonical roots and idempotent current grant',()=>{
     const c=claimed({extra_dirs:[outside,'.',outside],redline:['cfg:edit'],grants:['fs:delete']});
-    const result=S.issueExecutionGrant(db,c.id,'worker/main',{task_version:c.version});assert(result.ok);
+    const result=S.issueExecutionGrant(db,c.id,'worker/main',{task_version:c.version,probe:VALID_PROBE});assert(result.ok,JSON.stringify(result));
     assert.deepEqual(result.grant.roots,[fs.realpathSync(project),fs.realpathSync(outside)]);
     assert.deepEqual(result.grant.redline,['cfg:edit','fs:delete']);
     assert.equal(result.grant.task_version,c.version);
-    assert.equal(S.issueExecutionGrant(db,c.id,'worker/main').grant.grant_id,result.grant.grant_id);
+    assert.equal(S.issueExecutionGrant(db,c.id,'worker/main',{probe:VALID_PROBE}).grant.grant_id,result.grant.grant_id);
     assert.equal(S.getExecutionGrant(db,c.id,'other/main'),null);
   });
   check('partial unique index prevents concurrent duplicate live grants',()=>{

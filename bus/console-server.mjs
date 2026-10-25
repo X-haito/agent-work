@@ -6,8 +6,14 @@ import crypto from 'node:crypto';
 import * as S from './store.mjs';
 import * as A from './admin-config.mjs';
 import * as Auth from './auth.mjs';
+import * as boardUi from './board-ui.mjs';
 import { renderConsole, renderDenied } from './board-ui.mjs';
 import { KINDS } from './redline.mjs';
+import * as Archive from './archive.mjs';
+import * as Retention from './archive-retention.mjs';
+import * as LogInventory from './log-inventory.mjs';
+import * as MergeRunner from './merge-runner.mjs';
+import { runMergeRequest } from './merge-worker.mjs';
 
 const policyRuntime = fs.existsSync(new URL('./policy-runtime.mjs', import.meta.url)) ? await import('./policy-runtime.mjs') : null;
 
@@ -142,6 +148,7 @@ function normalizeTask(input, policy, partial) {
   if (!partial || has('write_scope')) out.write_scope = scopes(input.write_scope);
   if (!partial || has('max_subagents')) out.max_subagents = int(input.max_subagents == null ? 0 : input.max_subagents, '子代理上限', 0, 5);
   if (!partial || has('status')) out.status = input.status === 'proposed' ? 'proposed' : 'open';
+  if (!partial || has('token_budget')) out.token_budget = A.validateTokenBudget(input.token_budget);
   Object.assign(out, validateTaskFields(input));
   return out;
 }
@@ -220,6 +227,49 @@ function allTasks(db) {
   return rows.map(jsonScope);
 }
 
+// 归档概况只从 store 拿（阈值、daily 合并与计数口径都在 store 里）。
+// 这里一行聚合 SQL 都不写：否则归档后看板会和真实账本对不上。
+function archiveOverview(db, policy) {
+  if (typeof S.archiveStatus !== 'function') return null;
+  try {
+    const status = S.archiveStatus(db, policy);
+    if (!status || typeof status !== 'object') return null;
+    // 孤儿过期行的归类口径在 archive.mjs 里（与 buildPlan 同一套判定），这里只搬运计数。
+    let unmanaged = null;
+    try { unmanaged = typeof Archive.unmanagedSummary === 'function' ? Archive.unmanagedSummary(db, policy) : null; }
+    catch (e) { unmanaged = null; }
+    return Object.assign({}, status, { unmanaged: unmanaged });
+  } catch (e) { return null; }
+}
+
+// 二级保留与旧日志：只读概况。缺数据就返回 null，前端显示「—」，绝不拿 0 冒充。
+function retentionOverview(policy) {
+  try {
+    const summaryLayers = Retention.summarize(policy, {});
+    return summaryLayers && typeof summaryLayers === 'object' ? summaryLayers : null;
+  } catch (e) { return null; }
+}
+
+// /api/state 里只做小样本扫描（限制文件数，避免一次请求把大盘日志全哈希一遍）。
+function logsOverview(db) {
+  try {
+    // 看板会频繁轮询：只做分类不哈希（verified 为 null，前端显示「—」），全量的 hash 校验走 /api/logs/inventory。
+    const inventory = LogInventory.buildInventory(db, { limit: 200, hashFiles: false });
+    return {
+      root: inventory.root,
+      scanned: inventory.totals.files,
+      managed: inventory.totals.managed,
+      unmanaged: inventory.totals.unmanaged,
+      unmanaged_bytes: inventory.totals.unmanaged_bytes,
+      truncated: inventory.totals.files >= 200,
+      unmanaged_sample: inventory.unmanaged.slice(0, 20).map(function (row) {
+        return { relative_path: row.relative_path, bytes: row.bytes, reason: row.reason };
+      }),
+      scanned_at: inventory.scanned_at,
+    };
+  } catch (e) { return null; }
+}
+
 function runtimeState(db) {
   if (typeof S.getRuntimeState !== 'function') return { enabled: false, mode: 'unavailable', active_tasks: 0 };
   return S.getRuntimeState(db);
@@ -279,6 +329,11 @@ function snapshot(db, projectOptions, policyPath) {
     cost_by_project: typeof S.costByProject === 'function' ? S.costByProject(db, policy.lead) : null,
     policy_registry: policyRuntime && typeof policyRuntime.describePolicy === 'function' && Array.isArray(policyRuntime.POLICY_FIELDS) ? policyRuntime.POLICY_FIELDS : null,
     project_registry: projectList(db, projectOptions, policyPath), project_management: typeof A.createProject === 'function' && typeof A.deleteProject === 'function',
+    agentbus_version: agentbusVersion(),
+    lifecycle: lifecycleSnapshot(db),
+    archive: archiveOverview(db, policy),
+    archive_retention: retentionOverview(policy),
+    logs_inventory: logsOverview(db),
     runtime: runtimeState(db), policy: policy, projects: Object.keys(projectRegistry(projectOptions)).sort(), mcp: A.readMcpProfiles(), server_time: S.nowIso(),
   };
 }
@@ -346,6 +401,81 @@ function releaseTask(db, actor, taskId, note, policyPath) {
   return Object.assign({}, r, { ok: true, message: '已放行，记录在 guard_events' });
 }
 
+const BUS_UI_DIR = path.join(S.BUS_DIR, 'ui');
+
+// 版本号单一来源：package.json（与 agentbus version / MCP serverInfo 同处）。
+export function agentbusVersion() {
+  try { return String(JSON.parse(fs.readFileSync(path.join(S.BUS_DIR, '..', 'package.json'), 'utf8')).version || '0.0.0'); }
+  catch (error) { return '0.0.0'; }
+}
+
+// 真正把白名单资源写出去。版本号一致的请求给长期缓存（内容 hash 变了 URL 就变，不会撕裂）。
+function serveUiAsset(requested, versionParam, res) {
+  const asset = resolveUiAsset(requested);
+  if (!asset) return false;
+  const fresh = versionParam != null && String(versionParam) === asset.version;
+  const body = fs.readFileSync(path.join(BUS_UI_DIR, asset.name));
+  res.writeHead(200, {
+    'content-type': asset.type,
+    'cache-control': fresh ? 'public, max-age=31536000, immutable' : 'no-cache',
+    'x-content-type-options': 'nosniff',
+    'content-length': body.length,
+    'etag': 'W/"' + asset.version + '"',
+  });
+  res.end(body);
+  return true;
+}
+// 静态资源白名单：文件名 → MIME。只有这里列出来的才能被 /ui/ 服务。
+export const UI_ASSET_ALLOWLIST = {
+  'styles.css': 'text/css; charset=utf-8',
+  'denied.css': 'text/css; charset=utf-8',
+  // 第 14 项第 3 阶段：ES module 入口与拆分后的模块（显式列表，不做目录通配）
+  'main.mjs': 'text/javascript; charset=utf-8',
+  'api.mjs': 'text/javascript; charset=utf-8',
+  'state.mjs': 'text/javascript; charset=utf-8',
+  'components/dom.mjs': 'text/javascript; charset=utf-8',
+  'components/dialog.mjs': 'text/javascript; charset=utf-8',
+  'views/overview.mjs': 'text/javascript; charset=utf-8',
+  'views/tasks.mjs': 'text/javascript; charset=utf-8',
+  'views/projects.mjs': 'text/javascript; charset=utf-8',
+  'views/settings.mjs': 'text/javascript; charset=utf-8',
+  'views/reports.mjs': 'text/javascript; charset=utf-8',
+  // 第 2 阶段的单文件实现，冻结保留用于回滚（AGENTBUS_UI_INLINE=1）
+  'app.js': 'text/javascript; charset=utf-8',
+};
+
+// 路径规范化：拒绝 ..、绝对路径、盘符、编码绕过；只接受白名单里的裸文件名。
+export function resolveUiAsset(requested) {
+  const raw = String(requested || '');
+  if (!raw || raw.length > 96) return null;
+  let decoded = raw;
+  try { decoded = decodeURIComponent(raw); } catch (e) { return null; }
+  const backslash = String.fromCharCode(92);
+  if (decoded.indexOf(backslash) >= 0 || decoded.indexOf(String.fromCharCode(0)) >= 0) return null;
+  if (decoded === '.' || decoded === '..' || decoded.indexOf('..') >= 0) return null;
+  if (/^[A-Za-z]:/.test(decoded) || decoded.startsWith('/')) return null;
+  // 只允许一层子目录（components/… 或 views/…），且每一段都必须是非空、非 . 的名字
+  const segments = decoded.split('/');
+  if (segments.length > 2 || segments.some(function (s) { return !s || s === '.' || s === '..'; })) return null;
+  if (!Object.prototype.hasOwnProperty.call(UI_ASSET_ALLOWLIST, decoded)) return null;
+  return { name: decoded, type: UI_ASSET_ALLOWLIST[decoded], version: boardUi.uiAssetVersion(decoded) };
+}
+
+// 看板 CSP（第 14 项第 2 阶段完成后的真实形态）：
+//  · 外链模式（默认）= UI_CSP_TARGET 的形态：script-src 'self'、style-src 'self'。
+//    页面里已经没有任何内联 <script>/<style>，也没有 inline style 属性
+//    （13 处静态改成了 class，3 处动态改成 CSSOM setProperty —— CSP 只拦 style 属性，不拦 CSSOM）；
+//  · 内联模式（AGENTBUS_UI_INLINE=1 回滚）= 必须放开两处 'unsafe-inline'，否则回滚后页面直接不工作。
+export function uiContentSecurityPolicy(inlineAssets, strict) {
+  if (strict === true) return UI_CSP_TARGET + "; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+  const scriptSrc = inlineAssets ? "script-src 'self' 'unsafe-inline'" : "script-src 'self'";
+  const styleSrc = inlineAssets ? "style-src 'self' 'unsafe-inline'" : "style-src 'self'";
+  return ["default-src 'self'", scriptSrc, styleSrc, "connect-src 'self'",
+    "img-src 'self' data:", "font-src 'self'", "base-uri 'none'", "form-action 'self'", "frame-ancestors 'none'"].join('; ');
+}
+
+// 第 14 项第 2 阶段的目标 CSP（脚本抽出去之后启用）：script-src 收紧到 'self'。
+export const UI_CSP_TARGET = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'";
 // opts.policyPath：让看板读写指定的策略文件（测试用临时副本，缺省仍是真实 bus/policy.json）。
 export function createBoardServer(options) {
   const opts = options || {};
@@ -367,6 +497,15 @@ export function createBoardServer(options) {
       } catch (e) { /* 审计失败不阻断请求 */ }
     }
     try {
+      // 第 14 项第 1/8 条：静态资源走白名单，只有显式列出的文件可被服务。
+      // 路径规范化 + 拒绝 .. / 绝对路径 / 符号链接逃逸；找不到就 404，绝不回退到目录读取。
+      if (req.method === 'GET' && u.pathname.indexOf('/ui/') === 0) {
+        const requested = u.pathname.slice('/ui/'.length);
+        const served = serveUiAsset(requested, u.searchParams.get('v'), res);
+        if (served) return;
+        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+        res.end('not found'); return;
+      }
       if (req.method === 'GET' && u.pathname === '/favicon.ico') { res.writeHead(204, { 'cache-control': 'public, max-age=86400' }); res.end(); return; }
       // 浏览器首次带 ?token= 访问：校验一次性 token，换成会话 cookie，再重定向去掉 token。
       if (req.method === 'GET' && u.pathname === '/' && presentToken != null) {
@@ -383,10 +522,11 @@ export function createBoardServer(options) {
         httpError('缺少或已过期的看板会话，请使用启动时终端打印的一次性登录链接', 403, 'session_required');
       }
       if (req.method === 'GET' && u.pathname === '/') {
-        const body = renderConsole({ csrf: csrf, actor: actor });
+        const inlineAssets = boardUi.uiInlineMode({});
+        const body = renderConsole({ csrf: csrf, actor: actor, inlineAssets: inlineAssets });
         res.writeHead(200, {
           'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
-          'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+          'content-security-policy': uiContentSecurityPolicy(inlineAssets),
           'x-frame-options': 'DENY', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
         });
         res.end(body); return;
@@ -395,6 +535,111 @@ export function createBoardServer(options) {
       if (req.method === 'GET' && u.pathname === '/api/projects') { sendJson(res, 200, projectList(db, opts.projectOptions, opts.policyPath)); return; }
       if (req.method === 'GET' && u.pathname === '/api/reports') { sendJson(res, 200, taskReports(db, u.searchParams)); return; }
       if (req.method === 'GET' && u.pathname === '/api/bus/status') { sendJson(res, 200, runtimeState(db)); return; }
+      if (req.method === 'GET' && u.pathname === '/api/merge-requests') {
+        if (typeof S.listMergeRequests !== 'function') { sendJson(res, 200, { available: false, requests: [] }); return; }
+        const filter = { project: u.searchParams.get('project') || undefined, status: u.searchParams.get('status') || undefined, open: u.searchParams.get('open') === '1' || undefined };
+        sendJson(res, 200, { available: true, requests: S.listMergeRequests(db, filter) }); return;
+      }
+      if (req.method === 'POST' && /^\/api\/merge-requests\/[^/]+\/approve$/.test(u.pathname)) {
+        if (actor !== 'human') httpError('只有 Human 可以在看板批准合并', 403);
+        const id = decodeURIComponent(u.pathname.split('/')[3]);
+        const body = await readJson(req);
+        const result = S.approveMergeRequest(db, actor, id, Number.isInteger(body.version) ? body.version : undefined);
+        if (result && result.ok) { try { auth.logAudit(db, { actor: 'human', auth_method: 'console-session', action: 'merge.approve', resource: { id }, result: 'ok' }); } catch (e) {} }
+        sendJson(res, result && result.ok ? 200 : 400, result); return;
+      }
+      // 第 11 项第 9/12 条：批准只改状态；真正的 git 合并必须由 Human 显式点"执行合并"。
+      // preflight 给出二次确认所需的全部事实（项目、两端 ref、任务、最新验证、分支、工作树）。
+      const preflightMatch = u.pathname.match(/^\/api\/merge-requests\/([^/]+)\/preflight$/);
+      if (req.method === 'GET' && preflightMatch) {
+        const id = decodeURIComponent(preflightMatch[1]);
+        const mr = S.getMergeRequest(db, id);
+        if (!mr) { sendJson(res, 404, { ok: false, reason: 'not_found' }); return; }
+        let repo = null;
+        try { repo = await MergeRunner.repoState({ project: mr.project, projectOptions: opts.projectOptions }); }
+        catch (error) { repo = { ok: false, reason: 'repo_state_failed', detail: String((error && error.message) || error) }; }
+        const pre = S.mergePreflight(db, S.loadPolicy(opts.policyPath), id, { repo: repo });
+        sendJson(res, pre.ok ? 200 : 400, pre); return;
+      }
+      const executeMatch = u.pathname.match(/^\/api\/merge-requests\/([^/]+)\/execute$/);
+      if (req.method === 'POST' && executeMatch) {
+        if (actor !== 'human') httpError('只有 Human 可以执行合并', 403);
+        const id = decodeURIComponent(executeMatch[1]);
+        const body = await readJson(req);
+        let result = null;
+        try {
+          result = await runMergeRequest(db, S.loadPolicy(opts.policyPath), id, {
+            expectPreflight: body && typeof body.preflight_hash === 'string' ? body.preflight_hash : null,
+            projectOptions: opts.projectOptions, actor: actor,
+          });
+        } catch (error) {
+          result = { ok: false, status: 'error', reason: 'worker_threw', message: String((error && error.message) || error) };
+        }
+        try { auth.logAudit(db, { actor: 'human', auth_method: 'console-session', action: 'merge.execute', resource: { id }, result: result && result.ok ? 'ok' : String((result && result.reason) || 'failed') }); } catch (e) {}
+        sendJson(res, result && result.ok ? 200 : 400, result); return;
+      }
+      // 第 11 项第 13 条：崩溃遗留（merging）由 Human 决定重试或标失败；needs_human 只能由 Human 解除。
+      const recoverMatch = u.pathname.match(/^\/api\/merge-requests\/([^/]+)\/recover$/);
+      if (req.method === 'POST' && recoverMatch) {
+        if (actor !== 'human') httpError('只有 Human 可以处理崩溃遗留的合并', 403);
+        const id = decodeURIComponent(recoverMatch[1]);
+        const body = await readJson(req);
+        const action = String((body && body.action) || '');
+        let result = null;
+        if (action === 'fail') {
+          const mr = S.getMergeRequest(db, id);
+          result = mr ? S.finishMerge(db, id, { status: 'failed', error: String((body && body.note) || 'Human 判定为崩溃遗留') }, mr.version) : { ok: false, reason: 'not_found' };
+        } else if (action === 'retry') {
+          const mr = S.getMergeRequest(db, id);
+          let repo = null;
+          try { repo = await MergeRunner.repoState({ project: mr && mr.project, projectOptions: opts.projectOptions }); } catch (e) { repo = null; }
+          result = S.resetMergeForRetry(db, id, 'human', { inMerge: !!(repo && repo.in_merge), note: 'console recover --retry' });
+        } else {
+          result = { ok: false, reason: 'invalid_action', message: 'action 只能是 retry 或 fail' };
+        }
+        try { auth.logAudit(db, { actor: 'human', auth_method: 'console-session', action: 'merge.recover', resource: { id: id, action: action }, result: result && result.ok ? 'ok' : String((result && result.reason) || 'failed') }); } catch (e) {}
+        sendJson(res, result && result.ok ? 200 : 400, result); return;
+      }
+      const confirmMatch = u.pathname.match(/^\/api\/merge-requests\/([^/]+)\/confirm$/);
+      if (req.method === 'POST' && confirmMatch) {
+        if (actor !== 'human') httpError('只有 Human 可以重新确认合并', 403);
+        const id = decodeURIComponent(confirmMatch[1]);
+        const body = await readJson(req);
+        const result = S.confirmMergeRequest(db, id, 'human', body && body.preflight_hash);
+        try { auth.logAudit(db, { actor: 'human', auth_method: 'console-session', action: 'merge.confirm', resource: { id: id }, result: result && result.ok ? 'ok' : String((result && result.reason) || 'failed') }); } catch (e) {}
+        sendJson(res, result && result.ok ? 200 : 400, result); return;
+      }
+      if (req.method === 'GET' && u.pathname === '/api/reviews') {
+        if (typeof S.listReviews !== 'function') { sendJson(res, 200, { available: false, reviews: [] }); return; }
+        const filter = {
+          status: u.searchParams.get('status') || undefined,
+          route: u.searchParams.get('route') || undefined,
+          reviewer: u.searchParams.get('reviewer') || undefined,
+          project: u.searchParams.get('project') || undefined,
+          open: u.searchParams.get('open') === '1' || undefined,
+        };
+        sendJson(res, 200, { available: true, reviews: S.listReviews(db, filter), now: S.nowIso() }); return;
+      }
+      if (req.method === 'GET' && u.pathname === '/api/budget') {
+        if (typeof S.budgetStatus !== 'function') { sendJson(res, 200, { available: false }); return; }
+        const query = { agent: u.searchParams.get('agent') || undefined, project: u.searchParams.get('project') || undefined, dayKey: u.searchParams.get('day') || undefined };
+        sendJson(res, 200, Object.assign({ available: true }, S.budgetStatus(db, S.loadPolicy(opts.policyPath), query))); return;
+      }
+      // 旧日志全量 inventory：按需查（/api/state 只给小样本），只读，不删除任何文件。
+      if (req.method === 'GET' && u.pathname === '/api/logs/inventory') {
+        let inventory = null;
+        try { inventory = LogInventory.buildInventory(db, { limit: 2000 }); } catch (e) { inventory = null; }
+        if (!inventory) { sendJson(res, 200, { available: false }); return; }
+        sendJson(res, 200, { available: true, inventory: inventory }); return;
+      }
+      // 已归档任务的 archive path：按需单查（不随 /api/state 批量查，避免 200 次点查）。
+      const taskArchive = u.pathname.match(/^\/api\/tasks\/(t-\d+)\/archive$/);
+      if (req.method === 'GET' && taskArchive) {
+        if (typeof S.getTaskArchive !== 'function') { sendJson(res, 200, { available: false, archive: null }); return; }
+        let archive = null;
+        try { archive = S.getTaskArchive(db, taskArchive[1]) || null; } catch (e) { archive = null; }
+        sendJson(res, 200, { available: true, task_id: taskArchive[1], archive: archive }); return;
+      }
       if (req.method === 'GET' && u.pathname === '/api/tasks') { sendJson(res, 200, snapshot(db, opts.projectOptions, opts.policyPath).tasks); return; }
       const taskGet = u.pathname.match(/^\/api\/tasks\/(t-\d+)$/);
       if (req.method === 'GET' && taskGet) {
@@ -503,7 +748,14 @@ export function createBoardServer(options) {
       const mcp = u.pathname.match(/^\/api\/mcp\/(codex|claude|dsh)$/);
       if (req.method === 'PUT' && mcp) {
         const result = A.saveMcpProfile(mcp[1], await readJson(req));
-        sendJson(res, 200, Object.assign({ ok: true }, result)); return;
+        // 第 15 项第 10 条：改了 MCP 配置 → 该客户端必须重启才生效，写一条 restart_required。
+        const savedPath = (result.profile && result.profile.path) || null;
+        const savedHash = (function () {
+          try { return savedPath ? crypto.createHash('sha256').update(fs.readFileSync(savedPath)).digest('hex') : null; }
+          catch (e) { return null; }
+        })();
+        const marker = markRestartRequired(mcp[1], 'mcp_config_saved', { required_hash: savedHash });
+        sendJson(res, 200, Object.assign({ ok: true }, result, { restart_required: marker })); return;
       }
       httpError('没有这个接口', 404);
     } catch (e) {
@@ -524,6 +776,144 @@ export function createBoardServer(options) {
   });
   server.agentBus = { db: db, csrf: csrf, actor: actor, port: port, sessions: sessions, bootstrap: bootstrap };
   return server;
+}
+
+
+// ---------------------------------------------------------------- 生命周期与 restart_required（第 15 项第 10 条）
+// 状态落在运行目录的 lifecycle.json（本卡禁止改 schema，所以不进数据库）：
+//   components: board/codex/claude/dsh 的 pid/started_at/version/nonce/心跳
+//   restart_required: [{component, reason, required_hash, created_at}]
+// 清除规则只有一条：**看到组件真的重启了**（board 是新 started_at；MCP 客户端是它自己的心跳晚于 created_at）。
+export const LIFECYCLE_FILE = process.env.BUS_LIFECYCLE || path.join(S.BUS_DIR, 'lifecycle.json');
+export const LIFECYCLE_COMPONENTS = ['board', 'codex', 'claude', 'dsh'];
+const COMPONENT_AGENT = { codex: 'codex/main', claude: 'claude/main', dsh: 'dsh/main' };
+
+export function readLifecycle(file) {
+  const target = file || LIFECYCLE_FILE;
+  try {
+    const raw = JSON.parse(fs.readFileSync(target, 'utf8'));
+    return {
+      version: 1,
+      components: raw && typeof raw.components === 'object' && raw.components ? raw.components : {},
+      restart_required: Array.isArray(raw && raw.restart_required) ? raw.restart_required : [],
+      file: target,
+    };
+  } catch (error) {
+    return { version: 1, components: {}, restart_required: [], file: target };
+  }
+}
+
+export function writeLifecycle(state, file) {
+  const target = (state && state.file) || file || LIFECYCLE_FILE;
+  const body = { version: 1, components: (state && state.components) || {}, restart_required: (state && state.restart_required) || [] };
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const tmp = target + '.tmp-' + process.pid + '-' + Date.now();
+  fs.writeFileSync(tmp, JSON.stringify(body, null, 2) + '\n');
+  fs.renameSync(tmp, target);
+  return target;
+}
+
+export function processAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try { process.kill(n, 0); return true; } catch (error) { return error && error.code === 'EPERM'; }
+}
+
+// record 描述"我们自己启动的进程"：pid + nonce + started_at。进程活着但记录很旧 → stale（不猜、也不杀）。
+export function componentState(record, now) {
+  const at = now == null ? Date.now() : now;
+  if (!record || !record.pid) return { running: false, stale: false, record: record || null };
+  const alive = processAlive(record.pid);
+  const startedMs = Date.parse(record.started_at || '') || 0;
+  const ageMs = startedMs ? at - startedMs : null;
+  return {
+    running: alive, stale: alive && ageMs != null && ageMs > 24 * 3600 * 1000,
+    pid: Number(record.pid), started_at: record.started_at || null, version: record.version || null,
+    uptime_s: ageMs == null ? null : Math.max(0, Math.round(ageMs / 1000)), record: record,
+  };
+}
+
+export function recordComponent(name, patch, options) {
+  const file = options && options.file;
+  const state = readLifecycle(file);
+  state.components[name] = Object.assign({}, state.components[name] || {}, patch || {}, { updated_at: S.nowIso() });
+  writeLifecycle(state, file);
+  return state.components[name];
+}
+
+export function clearComponent(name, options) {
+  const file = options && options.file;
+  const state = readLifecycle(file);
+  if (state.components[name]) delete state.components[name];
+  writeLifecycle(state, file);
+  return state;
+}
+
+export function markRestartRequired(component, reason, options) {
+  const o = options || {};
+  if (LIFECYCLE_COMPONENTS.indexOf(component) < 0) return null;
+  const state = readLifecycle(o.file);
+  const existing = state.restart_required.filter(function (r) { return r.component === component; })[0];
+  const entry = {
+    component: component,
+    reason: String(reason || 'config_changed'),
+    required_hash: o.required_hash == null ? null : String(o.required_hash),
+    created_at: S.nowIso(),
+  };
+  state.restart_required = state.restart_required.filter(function (r) { return r.component !== component; }).concat([entry]);
+  writeLifecycle(state, o.file);
+  return entry;
+}
+
+// 逐项自动清除：只有"真的重启了"才算，没证据就继续挂着（宁可多提示一次，也不假装已经清掉）。
+export function resolveRestartRequired(db, options) {
+  const o = options || {};
+  const state = readLifecycle(o.file);
+  if (!state.restart_required.length) return { state: state, cleared: [] };
+  const agents = (function () { try { return S.listAgents(db) || []; } catch (e) { return []; } })();
+  const lastSeenOf = function (component) {
+    const agent = COMPONENT_AGENT[component];
+    const row = agent ? agents.filter(function (a) { return a.agent_id === agent; })[0] : null;
+    return row ? Date.parse(row.last_seen || '') || 0 : 0;
+  };
+  const boardRecord = state.components.board || null;
+  const cleared = [];
+  const kept = [];
+  for (const entry of state.restart_required) {
+    const createdAt = Date.parse(entry.created_at || '') || 0;
+    let evidence = 0;
+    if (entry.component === 'board') evidence = Date.parse((boardRecord && boardRecord.started_at) || '') || 0;
+    else evidence = lastSeenOf(entry.component);
+    if (evidence > createdAt) { cleared.push(Object.assign({ cleared_at: S.nowIso(), evidence_at: new Date(evidence).toISOString() }, entry)); continue; }
+    kept.push(entry);
+  }
+  if (cleared.length) { state.restart_required = kept; writeLifecycle(state, o.file); }
+  return { state: state, cleared: cleared };
+}
+
+// 看板侧只读快照：组件状态 + 待重启项（顺带把能证明已重启的项清掉）。
+export function lifecycleSnapshot(db, options) {
+  const resolved = resolveRestartRequired(db, options);
+  const state = resolved.state;
+  const components = LIFECYCLE_COMPONENTS.map(function (name) {
+    const detail = componentState(state.components[name]);
+    return {
+      component: name, running: detail.running, stale: detail.stale, pid: detail.pid || null,
+      started_at: detail.started_at || null, version: detail.version || null, uptime_s: detail.uptime_s,
+      last_heartbeat: name === 'board' ? (state.components.board && state.components.board.last_heartbeat) || null : null,
+    };
+  });
+  return {
+    file: state.file,
+    components: components,
+    restart_required: state.restart_required.map(function (r) {
+      return {
+        component: r.component, reason: r.reason, required_hash: r.required_hash, created_at: r.created_at,
+        command: r.component === 'board' ? 'agentbus restart --component board' : '重启 ' + r.component + ' 客户端（重启后这条会自动消失）',
+      };
+    }),
+    cleared_now: resolved.cleared,
+  };
 }
 
 export function startConsole(options) {

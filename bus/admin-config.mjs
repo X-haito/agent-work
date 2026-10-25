@@ -6,11 +6,16 @@ import { BUS_DIR, POLICY_PATH } from './store.mjs';
 import { KINDS } from './redline.mjs';
 import { validateValidators, verifierCwd } from './verifier.mjs';
 import { normalizeGrant, normalizeNetworkPolicy } from './network-policy.mjs';
+import { applyPolicyDefaults, unknownPolicyPaths } from './policy-schema.mjs';
+import { authReadiness, openDb } from './store.mjs';
+import * as FilePermissions from './platform/file-permissions.mjs';
 
 const AGENT_RE = /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*$/i;
 const AUTONOMY = ['off', 'propose', 'auto'];
 const COSTS = ['mechanical', 'tests', 'docs', 'standard', 'architectural', 'interface'];
-const PERMISSIONS = ['dispatch', 'accept', 'merge', 'reassign'];
+// 第 11 项第 11 条：merge 拆成 request_merge（可给 Lead）与 approve/execute（永远 Human，不进策略）。
+// legacy 'merge' 保留为请求权限的别名，避免旧配置直接失效。
+const PERMISSIONS = ['dispatch', 'accept', 'merge', 'request_merge', 'reassign'];
 export const NETWORK_GRANT_LIMIT = 8;
 const DSH_MCP_BEGIN = '# >>> agentbus managed entry >>>';
 const DSH_MCP_END = '# <<< agentbus managed entry <<<';
@@ -32,6 +37,30 @@ function integer(v, name, min, max, nullable) {
   return n;
 }
 
+// economics.budget_timezone：IANA 时区名，必须能被 Intl 解析（'UTC' 缺省）。
+function budgetTimezone(v) {
+  if (v == null || v === '') return 'UTC';
+  if (typeof v !== 'string' || !v.trim()) fail('economics.budget_timezone 必须是 IANA 时区名，例如 UTC 或 Asia/Shanghai');
+  const name = v.trim();
+  try { new Intl.DateTimeFormat('en-US', { timeZone: name }); } catch (error) {
+    fail('economics.budget_timezone 不是合法的 IANA 时区: ' + name);
+  }
+  return name;
+}
+
+// economics.default_turn_reserve：一次模型回合的预留额度，必须是正整数（0 会让预算形同虚设）。
+// 启用 daily_token_budget 时必须显式配置，否则预热阶段没有可用的兜底估算。
+function defaultTurnReserve(v, budgetEnabled) {
+  if (v == null || v === '') {
+    if (budgetEnabled) fail('启用 economics.daily_token_budget 时必须显式配置 economics.default_turn_reserve');
+    return null;
+  }
+  const n = Number(v);
+  if (!Number.isSafeInteger(n) || n <= 0) fail('economics.default_turn_reserve 必须是正整数（不允许 0）');
+  if (n > 100000000) fail('economics.default_turn_reserve 过大');
+  return n;
+}
+
 function strings(v, name, allowed) {
   if (!Array.isArray(v)) fail(name + ' 必须是数组');
   const out = [];
@@ -49,6 +78,32 @@ function networkPolicy(input) {
   const normalized = normalizeNetworkPolicy(input);
   if (!normalized.ok) fail('network 无效: ' + normalized.reason);
   return normalized.network;
+}
+
+// policy.retention：全部整数，0 表示"不清理该项"（保守缺省）。
+export function retentionPolicy(input) {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const days = ['terminal_task_days', 'message_days', 'guard_event_days', 'raw_usage_days', 'log_days',
+    'snapshot_days', 'archive_bundle_days'];
+  const out = {};
+  for (const key of days) out[key] = integer(raw[key] == null ? 0 : raw[key], 'retention.' + key, 0, 3650);
+  // 新名优先；旧名 max_log_bytes 只作读入回退（保存时不再写出，见 DEPRECATED_POLICY_PATHS）。
+  const singleLog = raw.max_single_log_bytes == null ? raw.max_log_bytes : raw.max_single_log_bytes;
+  out.max_single_log_bytes = integer(singleLog == null ? 0 : singleLog, 'retention.max_single_log_bytes', 0, 100000000000);
+  out.archive_lease_ttl_min = integer(raw.archive_lease_ttl_min == null ? 30 : raw.archive_lease_ttl_min, 'retention.archive_lease_ttl_min', 0, 1440);
+  out.prune_unmanaged = integer(raw.prune_unmanaged == null ? 0 : raw.prune_unmanaged, 'retention.prune_unmanaged', 0, 1);
+  // 第 10 项第 12 条：二级保留的硬下限（最新 N 个必须留住）
+  const minimums = ['min_snapshots', 'min_archive_bundles'];
+  for (const key of minimums) out[key] = integer(raw[key] == null ? 0 : raw[key], 'retention.' + key, 0, 1000);
+  return out;
+}
+
+// 任务级 token 预算（可空正整数）：空表示只受日预算限制。
+export function validateTokenBudget(value) {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n <= 0) fail('token_budget 必须是正整数，留空表示只受日预算限制');
+  return n;
 }
 
 // 任务字段 network_grants：[{ protocol, host, ports, purpose }]，逐项按网络白名单规范校验。
@@ -73,6 +128,11 @@ function agentId(v, name, allowHuman) {
 
 export function validatePolicy(input, options) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('策略必须是对象');
+  // 第 15 项：未知字段必须报错并指出路径，绝不静默丢弃（这是"新增字段忘记接线"的兜底）
+  const unknown = unknownPolicyPaths(input);
+  if (unknown.length) fail('策略包含未登记的字段: ' + unknown.join(', '));
+  // 同一份 schema 补默认值：缺失字段按声明补，false / null / [] 不会被覆盖
+  input = applyPolicyDefaults(input);
   const rawAgents = input.agents;
   if (!rawAgents || typeof rawAgents !== 'object' || Array.isArray(rawAgents) || !Object.keys(rawAgents).length) {
     fail('至少需要一个 Agent');
@@ -106,15 +166,17 @@ export function validatePolicy(input, options) {
   if (options && options.syncLeadPermissions) {
     permissions.dispatch = lead === 'human' ? ['human'] : [lead];
     permissions.accept = lead === 'human' ? ['human'] : [lead, 'human'];
-    permissions.merge = ['human'];
+    // 申请权限默认给 Lead + Human；不再把 merge 强制覆盖成 ['human']（那会让 Lead 根本发不出合并申请）。
+    permissions.request_merge = lead === 'human' ? ['human'] : [lead, 'human'];
     permissions.reassign = lead === 'human' ? ['human'] : [lead];
   }
 
   const g = input.global || {};
   const e = input.economics || {};
+  const dailyBudget = integer(e.daily_token_budget, 'economics.daily_token_budget', 1, 1000000000, true);
   // redline 决定哪些红线必须由人类批；漏掉它会让 savePolicy 把用户改过的白名单抹掉
   const rl = input.redline || {};
-  return {
+  const policy = {
     lead: lead,
     redline: {
       human_only: strings(rl.human_only == null ? KINDS.slice() : rl.human_only, 'redline.human_only', KINDS),
@@ -128,6 +190,7 @@ export function validatePolicy(input, options) {
       require_credentials: bool(g.require_credentials === true, 'global.require_credentials'),
     },
     network: networkPolicy(input.network),
+    retention: retentionPolicy(input.retention),
     economics: {
       lead_may_read_files: bool(e.lead_may_read_files === true, 'economics.lead_may_read_files'),
       lead_may_write_code: bool(e.lead_may_write_code === true, 'economics.lead_may_write_code'),
@@ -142,10 +205,56 @@ export function validatePolicy(input, options) {
       max_changed_files: integer(e.max_changed_files == null ? 20 : e.max_changed_files, 'economics.max_changed_files', 1, 10000),
       max_subagents: integer(e.max_subagents == null ? 0 : e.max_subagents, 'economics.max_subagents', 0, 5),
       review_timeout_min: integer(e.review_timeout_min == null ? 30 : e.review_timeout_min, 'economics.review_timeout_min', 1, 10080),
-      daily_token_budget: integer(e.daily_token_budget, 'economics.daily_token_budget', 1, 1000000000, true),
+      daily_token_budget: dailyBudget,
+      budget_timezone: budgetTimezone(e.budget_timezone),
+      default_turn_reserve: defaultTurnReserve(e.default_turn_reserve, dailyBudget != null),
     },
     agents: agents,
   };
+  assertAuthReadiness(policy, options);
+  return policy;
+}
+
+// require_credentials 不能靠"直接改 JSON"打开：必须先过 doctor --auth-readiness。
+// 判定逻辑在 store.authReadiness（CLI 与这里共用同一份），这里只负责拦截。
+// options.authReadiness 供测试注入；否则现场打开凭据库自查（查不到就拒绝，fail-closed）。
+function assertAuthReadiness(policy, options) {
+  if (!policy || !policy.global || policy.global.require_credentials !== true) return;
+  const opts = options || {};
+  let readiness = opts.authReadiness || null;
+  if (!readiness) {
+    let db = null;
+    try {
+      db = openDb(opts.dbPath);
+      readiness = authReadiness(db, { profiles: readMcpProfiles(opts), verify: FilePermissions.verify, requireCredentials: true });
+    } catch (error) {
+      fail('auth_readiness_unavailable: 无法读取凭据库（' + String((error && error.message) || error) + '），拒绝开启 require_credentials');
+    } finally {
+      if (db) { try { db.close(); } catch (e) {} }
+    }
+  }
+  if (!readiness || readiness.ready !== true) {
+    const blockers = (readiness && Array.isArray(readiness.blockers) && readiness.blockers.length) ? readiness.blockers : ['就绪检查没有返回结果'];
+    fail('auth_readiness_failed: 未就绪，禁止开启 require_credentials —— ' + blockers.slice(0, 5).join('；'));
+  }
+}
+
+// 权限加固：只记录、不抛错。
+// 安全门禁在别处：doctor --auth-readiness 用 file-permissions.verify() 判定，未通过就禁止
+// 把 require_credentials 置 true。所以这里既不能假装成功（ok 原样返回），也不能把
+// 「本机沙箱改不了 ACL」变成写不进配置 —— 那会让所有写路径都死掉。
+function hardenAndRecord(target, label) {
+  if (!target) return { label: label, target: null, ok: false, method: 'unsupported', detail: '空路径' };
+  let result = null;
+  try { result = FilePermissions.harden(target); }
+  catch (error) { result = { ok: false, method: 'unsupported', detail: String((error && error.message) || error) }; }
+  const record = { label: label, target: target, ok: !!(result && result.ok === true),
+    method: (result && result.method) || 'unsupported', detail: (result && result.detail) || '' };
+  if (!record.ok) {
+    try { process.stderr.write('[' + label + '] 权限加固未成功（' + record.method + ': ' + record.detail + '）: ' + target +
+      '；已记录在返回值的 acl 字段，doctor --auth-readiness 会据此判定未就绪\n'); } catch (e) {}
+  }
+  return record;
 }
 
 export function atomicWrite(file, content) {
@@ -154,12 +263,16 @@ export function atomicWrite(file, content) {
   const backup = file + '.bak-' + stamp;
   const temp = file + '.tmp-' + process.pid + '-' + Date.now();
   fs.writeFileSync(temp, content, { encoding: 'utf8', mode: 0o600 });
+  // 先在临时文件上加固：strict 时拿不到「只有当前用户可访问」就不进入 rename，避免半完成。
+  const tempAcl = hardenAndRecord(temp, '临时文件');
   let hadFile = false;
   try {
     hadFile = fs.existsSync(file);
     if (hadFile) fs.renameSync(file, backup);
     fs.renameSync(temp, file);
-    return { path: file, backup: hadFile ? backup : null };
+    const fileAcl = hardenAndRecord(file, '配置文件');
+    const backupAcl = hadFile ? hardenAndRecord(backup, '备份文件') : { label: '备份文件', target: null, ok: false, method: 'unsupported', detail: '没有旧文件' };
+    return { path: file, backup: hadFile ? backup : null, acl: { temp: tempAcl, file: fileAcl, backup: backupAcl } };
   } catch (e) {
     try { if (fs.existsSync(temp)) fs.unlinkSync(temp); } catch (ignore) {}
     try { if (hadFile && !fs.existsSync(file) && fs.existsSync(backup)) fs.renameSync(backup, file); } catch (ignore) {}
@@ -209,7 +322,24 @@ export function readProjectsRegistry(options) {
       !registry.projects || typeof registry.projects !== 'object' || Array.isArray(registry.projects)) {
     fail('项目登记文件必须包含 projects 对象');
   }
+  // 单一全局 Lead：项目级 lead 一律无效。旧配置里的该字段只产生 migration warning，不静默生效。
+  const warnings = [];
+  for (const id of Object.keys(registry.projects)) {
+    const entry = registry.projects[id];
+    if (entry && typeof entry === 'object' && Object.prototype.hasOwnProperty.call(entry, 'lead')) {
+      warnings.push('项目 ' + id + ' 带有已废弃的 lead 字段：Lead 只有全局一个（policy.lead），该字段被忽略，请删除');
+    }
+  }
+  registry.warnings = warnings;
   return registry;
+}
+
+// 项目输入里出现 lead 直接拒绝：不支持项目级 Lead 覆盖
+function rejectProjectLead(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return;
+  if (Object.prototype.hasOwnProperty.call(input, 'lead')) {
+    fail('项目不允许设置 lead：Lead 只有全局一个（policy.lead），请改用策略页');
+  }
 }
 
 function projectId(id) {
@@ -241,6 +371,7 @@ export function validateProjectValidators(input) { return validateValidators(inp
 
 export function createProject(input, options) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('项目必须是对象');
+  rejectProjectLead(input);
   const id = projectId(input.id);
   const explicitPath = input.path !== undefined && !(typeof input.path === 'string' && !input.path.trim());
   const target = explicitPath ? input.path : path.resolve(projectOptions(options).workspaceRoot, id);
@@ -445,6 +576,32 @@ function validateMcpInput(input) {
   return { enabled: enabled, agent: agent, token: token };
 }
 
+// 仅新增：把与 saveMcpProfile 完全一致的内容写到指定路径。
+// 做法是把基线文件镜像到临时 home，再复用 saveMcpProfile（签名与行为不变），最后搬到目标路径。
+export function writeMcpProfileTo(client, input, targetPath, options) {
+  const o = options || {};
+  if (client !== 'codex' && client !== 'claude' && client !== 'dsh') return { ok: false, error: 'unsupported_client' };
+  if (client === 'codex' && process.env.CODEX_HOME) return { ok: false, error: 'codex_home_override' };
+  if (!targetPath) return { ok: false, error: 'target_required' };
+  let mirror = null;
+  try {
+    mirror = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-mcp-'));
+    const mirrored = targetPaths(mirror)[client];
+    fs.mkdirSync(path.dirname(mirrored), { recursive: true });
+    const source = o.sourcePath || targetPaths(o.homeDir)[client];
+    if (source && fs.existsSync(source)) fs.copyFileSync(source, mirrored);
+    saveMcpProfile(client, input, { homeDir: mirror });
+    const content = fs.readFileSync(mirrored);
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, content, { mode: 0o600 });
+    return { ok: true, path: targetPath, bytes: content.length };
+  } catch (error) {
+    return { ok: false, error: String((error && error.message) || error) };
+  } finally {
+    if (mirror) { try { fs.rmSync(mirror, { recursive: true, force: true }); } catch (error) { /* ignore */ } }
+  }
+}
+
 export function saveMcpProfile(client, input, options) {
   const cfg = validateMcpInput(input);
   const targets = targetPaths(options && options.homeDir);
@@ -479,9 +636,8 @@ export function saveMcpProfile(client, input, options) {
     content = withoutDshManagedBlock(current);
     if (cfg.enabled) content += '\n' + dshManagedBlock(script, cfg.agent, cfg.token);
   }
+  // MCP 配置文件（可能含 token）：加固结果原样记录在 acl 字段里返回，失败只告警不抛错。
   const result = atomicWrite(file, content);
-  // 配置文件含凭据，尽量收到仅当前用户可读；Windows 上 chmod 基本无效，需 ACL helper 才能完全落实
-  try { fs.chmodSync(file, 0o600); } catch (e) {}
   const profile = readMcpProfiles(options).find(function (x) { return x.id === client; });
-  return { profile: profile, backup: result.backup, restart_required: true };
+  return { profile: profile, backup: result.backup, acl: result.acl ? result.acl.file : null, restart_required: true };
 }

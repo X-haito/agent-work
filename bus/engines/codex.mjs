@@ -1,18 +1,25 @@
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import * as Isolation from '../isolation/provider.mjs';
 
-// networkIsolation=false 是事实陈述，不是待办：codex 子进程可以无视 HTTP_PROXY/HTTPS_PROXY 直接建连，
-// 本机也没有 OS 级网络隔离，所以代理只能审计，不能强制。
-export function capabilities() {
-  return {
-    strongWriteIsolation: true,
+// 能力不再自述（第 3 项第 9 条）：strongWriteIsolation / networkIsolation 一律由
+// isolation provider 的 probe 结果推导。本机 host-native 没有 OS 级隔离，container 也没有
+// 可用运行时 → 两者都是 false，codex 不再声称"强写隔离"。
+// 想变成 true 只有一条路：跑 canary（doctor --probe-engine）拿到 verified 的 probe 结果。
+export function capabilities(options = {}) {
+  const isolated = Isolation.resolveCapability(options);
+  return Object.assign({}, isolated.capability, {
+    engine: 'codex',
     supportsAddDir: true,
-    networkIsolation: false,
-    notes: [
-      '固定 workspace-write；授权根由 --add-dir 显式传入',
-      'networkIsolation=false：只能注入 HTTP(S)_PROXY 做审计，无法阻止 codex 子进程绕过代理直连',
+    mechanisms: [
+      '固定 workspace-write；授权根由 --add-dir 显式传入（CLI 侧沙箱，未用 canary 验证）',
+      '能做的：grant roots 准入 + 执行后快照；不能做的：阻止进程写出这些根',
     ],
-  };
+    notes: (isolated.probe.notes || []).concat([
+      'strongWriteIsolation / networkIsolation 由 probe 推导，adapter 不自述',
+      'networkIsolation=false：只能注入 HTTP(S)_PROXY 做审计，无法阻止 codex 子进程绕过代理直连',
+    ]),
+  });
 }
 
 export const NETWORK_UNENFORCEABLE = '仅审计，无法强制隔离：执行端无法阻止子进程绕过代理直连，联网目标白名单无法强制执行';
@@ -40,9 +47,9 @@ export function requiresNetwork(grant, task = {}) {
   return kinds.indexOf('net:egress') >= 0 || networkGrantsOf(task).length > 0;
 }
 
-function deferToHuman(S, db, task, owner, reason, message) {
+function deferToHuman(S, db, task, owner, reason, message, extra) {
   if (typeof S.deferExecutionTask !== 'function') return { ok: false, reason: 'execution_grant_api_unavailable', message: '缺少 deferExecutionTask；' + message, deferred: false };
-  const deferred = S.deferExecutionTask(db, task.id, owner, message);
+  const deferred = S.deferExecutionTask(db, task.id, owner, message, Object.assign({ reason: reason }, extra || {}));
   return { ...deferred, ok: false, reason: deferred.ok ? reason : (deferred.reason || reason), message, deferred: deferred.ok === true };
 }
 export function checkGrant(grant) {
@@ -61,13 +68,13 @@ export function requiresStrongIsolation(grant, task = {}) {
 export function admitTask(S, db, task, owner, engine, grant) {
   const caps = engine.capabilities() || {};
   if (requiresNetwork(grant, task)) {
-    if (caps.networkIsolation !== true) return deferToHuman(S, db, task, owner, 'engine_network_isolation_unsupported', NETWORK_UNENFORCEABLE);
+    if (caps.networkIsolation !== true) return deferToHuman(S, db, task, owner, 'network_isolation_unavailable', NETWORK_UNENFORCEABLE, { provider: caps.provider, verified: caps.verified, probeReason: caps.reason });
     if (!networkGrantsOf(task).length) {
       return deferToHuman(S, db, task, owner, 'network_grants_missing', '联网任务缺少目标级 network_grants：需要 Human 先批准具体协议/主机/端口');
     }
   }
   if (caps.strongWriteIsolation || !requiresStrongIsolation(grant, task)) return { ok: true };
-  return deferToHuman(S, db, task, owner, 'engine_isolation_unsupported', '执行端不支持强隔离：隔离配置不可用，extra_dirs、删除或配置授权需要 Human 处理');
+  return deferToHuman(S, db, task, owner, 'engine_isolation_unsupported', '执行端不支持强隔离：隔离配置不可用，extra_dirs、删除或配置授权需要 Human 处理', { provider: caps.provider, verified: caps.verified, probeReason: caps.reason });
 }
 export function planArgs(grant, prompt, opts = {}) {
   const roots = checkGrant(grant);

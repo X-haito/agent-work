@@ -1,0 +1,128 @@
+{
+  "_note": "这是 AgentBus 的默认策略示例，请按需修改：lead / permissions / agents 都应改成你自己的 agent 与授权。init 复制成 policy.json 时会去掉以 _ 开头的说明字段。",
+  "lead": "codex/main",
+  "redline": {
+    "human_only": [
+      "dep:install",
+      "fs:delete",
+      "git:risky",
+      "cfg:edit",
+      "net:egress"
+    ]
+  },
+  "permissions": {
+    "dispatch": [
+      "codex/main"
+    ],
+    "accept": [
+      "codex/main",
+      "human"
+    ],
+    "merge": [
+      "human"
+    ],
+    "request_merge": [
+      "codex/main",
+      "human"
+    ],
+    "reassign": [
+      "codex/main"
+    ]
+  },
+  "global": {
+    "dispatch_enabled": true,
+    "max_dispatch_depth": 2,
+    "max_chain_len": 3,
+    "rate_per_agent_per_hour": 20,
+    "require_credentials": false
+  },
+  "network": {
+    "default": "deny",
+    "local_services": [
+      {
+        "port": 7400,
+        "purpose": "AgentBus 本地看板"
+      }
+    ]
+  },
+  "economics": {
+    "lead_may_read_files": false,
+    "lead_may_write_code": false,
+    "lead_wake_on": [
+      "contract_conflict",
+      "retry_exceeded",
+      "cross_module_decision"
+    ],
+    "report_max_lines": 40,
+    "report_no_raw_diff": true,
+    "auto_accept": [
+      "mechanical",
+      "tests",
+      "docs"
+    ],
+    "peer_review": [
+      "standard"
+    ],
+    "lead_review": [
+      "architectural",
+      "interface"
+    ],
+    "max_rounds_per_task": 2,
+    "max_changed_files": 20,
+    "max_subagents": 0,
+    "review_timeout_min": 30,
+    "require_verify_cmd": true,
+    "daily_token_budget": null,
+    "budget_timezone": "Asia/Shanghai",
+    "default_turn_reserve": 20000
+  },
+  "retention": {
+    "terminal_task_days": 0,
+    "message_days": 0,
+    "guard_event_days": 0,
+    "raw_usage_days": 0,
+    "log_days": 0,
+    "max_single_log_bytes": 0,
+    "snapshot_days": 0,
+    "archive_bundle_days": 0,
+    "min_snapshots": 0,
+    "min_archive_bundles": 0,
+    "archive_lease_ttl_min": 30
+  },
+  "agents": {
+    "codex/main": {
+      "autonomy": "auto",
+      "may_dispatch_to": [
+        "claude/main",
+        "dsh/main"
+      ],
+      "max_open_from_agents": 5,
+      "max_concurrent": 1,
+      "capabilities": [
+        "planning",
+        "review",
+        "arbitration"
+      ]
+    },
+    "claude/main": {
+      "autonomy": "auto",
+      "may_dispatch_to": [],
+      "max_open_from_agents": 3,
+      "max_concurrent": 1,
+      "capabilities": [
+        "frontend",
+        "typescript"
+      ]
+    },
+    "dsh/main": {
+      "autonomy": "auto",
+      "may_dispatch_to": [],
+      "max_open_from_agents": 3,
+      "max_concurrent": 1,
+      "capabilities": [
+        "backend",
+        "tooling"
+      ]
+    }
+  }
+}

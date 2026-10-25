@@ -45,6 +45,14 @@ function sliceFunction(source, header) {
 }
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-egress-'));
+// unknown_agent 现在是硬拒：占位 actor 必须登记进**本套件自己的临时策略**（真实 policy 打底，不设任何白名单后门）。
+const placeholderPolicy = path.join(temp, 'policy-placeholder.json');
+const placeholderBase = JSON.parse(fs.readFileSync(path.join(S.BUS_DIR, 'policy.json'), 'utf8'));
+placeholderBase.agents = Object.assign({}, placeholderBase.agents, {
+  worker: { autonomy: 'auto', may_dispatch_to: ['*'], max_open_from_agents: 100, max_concurrent: 5 },
+});
+fs.writeFileSync(placeholderPolicy, JSON.stringify(placeholderBase));
+process.env.BUS_POLICY_PATH = placeholderPolicy;
 const servers = [];
 const proxies = [];
 let db = null;
@@ -120,7 +128,15 @@ try {
     ok(name + ' 声明 networkIsolation=false', caps.networkIsolation === false, JSON.stringify(caps));
     ok(name + ' notes 说明无法阻止绕过代理', caps.notes.some(note => /绕过代理|无法/.test(note)), JSON.stringify(caps.notes));
   }
-  ok('写隔离能力未被网络字段改动（codex 强、claude/dsh 弱）', Codex.capabilities().strongWriteIsolation === true && Claude.capabilities().strongWriteIsolation === false && Dsh.capabilities().strongWriteIsolation === false);
+  // 第 3 项第 9 条：隔离能力只能由 isolation provider 的 probe 推导，adapter 不再自述。
+  // 字段缺失（undefined）或为 false 都算"没有自述"，只有 === true 才是违规，
+  // 这样即便以后字段被移除，这条断言依然守得住"不自述"这个不变量。
+  function notSelfClaiming(caps) {
+    return caps.strongWriteIsolation !== true && caps.networkIsolation !== true && caps.verified !== true;
+  }
+  ok('codex 不再自述强隔离（codex/claude/dsh 都不声称隔离能力）',
+    notSelfClaiming(Codex.capabilities()) && notSelfClaiming(Claude.capabilities()) && notSelfClaiming(Dsh.capabilities()),
+    { codex: Codex.capabilities().strongWriteIsolation, claude: Claude.capabilities().strongWriteIsolation, dsh: Dsh.capabilities().strongWriteIsolation });
   ok('EGRESS_UNENFORCEABLE 写明仅审计且无法强制隔离', /仅审计/.test(EGRESS_UNENFORCEABLE) && /无法强制隔离/.test(EGRESS_UNENFORCEABLE), EGRESS_UNENFORCEABLE);
   ok('engine 的联网说明同样写明无法强制执行', /仅审计/.test(Codex.NETWORK_UNENFORCEABLE) && /无法强制执行/.test(Codex.NETWORK_UNENFORCEABLE), Codex.NETWORK_UNENFORCEABLE);
 
@@ -140,7 +156,7 @@ try {
   }
 
   const claudeNet = admitWith(Claude, { network_grants: netGrants });
-  ok('claude 联网任务被转待批', claudeNet.result.ok === false && claudeNet.result.reason === 'engine_network_isolation_unsupported', JSON.stringify(claudeNet.result));
+  ok('claude 联网任务被转待批', claudeNet.result.ok === false && claudeNet.result.reason === 'network_isolation_unavailable', JSON.stringify(claudeNet.result));
   ok('claude 联网任务状态 proposed + needs_human + owner 清空',
     claudeNet.saved.status === 'proposed' && claudeNet.saved.needs_human === 1 && claudeNet.saved.owner === null,
     JSON.stringify({ status: claudeNet.saved.status, needs_human: claudeNet.saved.needs_human, owner: claudeNet.saved.owner }));
@@ -149,7 +165,7 @@ try {
   ok('转待批结果带 deferred 标记（supervisor 不会把卡再判 failed）', claudeNet.result.deferred === true);
 
   const dshNet = admitWith(Dsh, { network_grants: netGrants });
-  ok('dsh 联网任务同样转待批', dshNet.result.reason === 'engine_network_isolation_unsupported' && dshNet.saved.status === 'proposed', JSON.stringify(dshNet.result));
+  ok('dsh 联网任务同样转待批', dshNet.result.reason === 'network_isolation_unavailable' && dshNet.saved.status === 'proposed', JSON.stringify(dshNet.result));
 
   const enforcedNet = admitWith(enforced, { network_grants: netGrants });
   ok('声明了强制隔离的引擎才能启动联网任务', enforcedNet.result.ok === true, JSON.stringify(enforcedNet.result));

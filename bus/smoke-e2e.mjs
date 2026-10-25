@@ -7,6 +7,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import * as S from './store.mjs';
+import * as Contracts from './smoke-support/contracts.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DB = path.join(os.tmpdir(), 'agentbus-e2e-' + process.pid + '.db');
@@ -80,7 +81,12 @@ try {
   console.log('');
   console.log('[3] 工作者能看到待批任务，但认领不了');
   const ct = await w1.call('bus_tasks', {});
-  ok('看到这张卡', ct.tasks.some(function (t) { return t.id === d.task.id; }), ct.tasks.length);
+  // 第 11 项第 1 条：这里以前读旧字段 ct.tasks，分页改造后会静默变成 undefined 并在 SKIP 掩护下不被发现。
+  // 现在用契约校验：形状不对直接抛带字段名的 ContractError，绝不退化成可选链。
+  const ctItems = Contracts.taskPagePayload(ct);
+  ok('看到这张卡', ctItems.some(function (t) { return t.id === d.task.id; }), ctItems.length);
+  ok('bus_tasks 返回分页结构（items/count/next_cursor/has_more）',
+    Array.isArray(ct.items) && typeof ct.count === 'number' && typeof ct.has_more === 'boolean' && 'next_cursor' in ct, Object.keys(ct || {}));
   const early = await w1.call('bus_claim', { task_id: d.task.id });
   ok('待批状态认领被拒', early.ok === false && early.reason === 'needs_approval', early);
 

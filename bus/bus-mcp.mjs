@@ -2,6 +2,7 @@
 // Agent Bus MCP server（零依赖，stdio JSON-RPC）。
 // 启动: node bus-mcp.mjs --agent codex/main [--db path]
 // 身份也可用环境变量 AGENT_BUS_ID 指定（有些宿主只让配 env）。
+import fs from 'node:fs';
 import readline from 'node:readline';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +11,7 @@ import { validateTaskFields } from './console-server.mjs';
 import { validateNetworkGrants } from './admin-config.mjs';
 import { KINDS } from './redline.mjs';
 import * as Creds from './auth.mjs';
+import * as MCP from './mcp/tools.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -93,6 +95,18 @@ function staleReviewCount() {
   } catch (e) { return 0; }
 }
 
+// reviews 表由第 9 项数据层落地；读不到就返回 null，交给 storeFn 的 not_available 处理。
+function reviewRowOf(reviewId) {
+  try { return DB.prepare('SELECT id,task_id,reviewer,route,status,task_version FROM reviews WHERE id=?').get(String(reviewId || '')) || null; }
+  catch (e) { return null; }
+}
+
+// 合并权限只用于提示"你能否发起申请"；批准与执行永远只在看板上由 Human 完成。
+function canRequestMerge() {
+  const allow = (policy && policy.permissions && policy.permissions.merge) || [];
+  return Array.isArray(allow) && (allow.indexOf(AGENT) >= 0 || AGENT === 'human');
+}
+
 function sweepReviews() {
   if (!S.getRuntimeState(DB).enabled) return;
   const fn = storeFn('sweepReviews');
@@ -100,44 +114,29 @@ function sweepReviews() {
   try { fn(DB, policy); } catch (e) {}
 }
 
+// 仅作 handler 注册表：name → handler（参数已由 bus/mcp/tools.mjs 的 strict schema 校验过）。
+// 元信息（title/description/inputSchema/outputSchema/annotations）单一来源 = bus/mcp/tools.mjs。
 const TOOLS = [
   {
     name: 'bus_runtime_status',
-    description: '读取 AgentBus 全局运行状态；仅 Human 可在本地控制台启用。',
-    inputSchema: { type: 'object', properties: {} },
     handler: function () { return S.getRuntimeState(DB); },
   },
   {
     name: 'bus_renew_lease',
-    description: '续租已认领任务；关闭排空期间仍可使用。',
-    inputSchema: { type: 'object', properties: { task_id: { type: 'string' }, lease_min: { type: 'number' } }, required: ['task_id'] },
     handler: function (a) { return { ok: S.renewLease(DB, AGENT, a.task_id, a.lease_min) }; },
   },
   {
     name: 'bus_online',
-    description: '查看谁在线、各自手上有几个活。开工前先调这个。',
-    inputSchema: { type: 'object', properties: {} },
     handler: function () { S.heartbeat(DB, AGENT, 'idle'); return { me: AGENT, agents: S.listAgents(DB) }; },
   },
   {
     name: 'bus_send',
-    description: '发送一条消息（纯信息，不产生任务）。kind 取自封闭词表: note/question/answer/status/handoff/task.progress。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        to: { type: 'string' }, kind: { type: 'string' }, body: { type: 'string' },
-        thread: { type: 'string' }, refs: { type: 'object' }, reply_to: { type: 'string' }, msg_id: { type: 'string' },
-      },
-      required: ['to', 'kind', 'body'],
-    },
     handler: function (a) {
       return S.send(DB, { sender: AGENT, to: a.to, kind: a.kind, body: a.body, thread: a.thread, refs: a.refs, reply_to: a.reply_to, msg_id: a.msg_id, hop: 1 });
     },
   },
   {
     name: 'bus_wait',
-    description: '长轮询取新消息。空闲时反复调用它 —— 这是"实时"的全部秘密。timeout_ms 上限 55000。',
-    inputSchema: { type: 'object', properties: { since_seq: { type: 'number' }, timeout_ms: { type: 'number' } } },
     handler: async function (a) {
       S.heartbeat(DB, AGENT, 'idle');
       return await S.waitFor(DB, AGENT, typeof a.since_seq === 'number' ? a.since_seq : undefined, a.timeout_ms == null ? 25000 : a.timeout_ms);
@@ -145,18 +144,16 @@ const TOOLS = [
   },
   {
     name: 'bus_tasks',
-    description: '列出任务。默认只列未结束的。',
-    inputSchema: { type: 'object', properties: { status: { type: 'string' }, owner: { type: 'string' }, project: { type: 'string' } } },
     handler: function (a) {
       const extra = guardFieldsById();
-      const rows = S.listTasks(DB, a);
-      return { tasks: rows.map(function (r) { return Object.assign({}, r, cardFields(Object.assign({}, extra[r.id], r))); }) };
+      return MCP.pageTasks(DB, {
+        limit: a.limit, cursor: a.cursor, status: a.status, owner: a.owner, project: a.project,
+        decorate: function (r) { return Object.assign({}, r, cardFields(Object.assign({}, extra[r.id], r))); },
+      });
     },
   },
   {
     name: 'bus_claim',
-    description: '认领任务。条件更新，抢不到会返回实际 owner；write_scope 重叠会被拒。返回里带 workspace（cwd/branch），照着它干活。',
-    inputSchema: { type: 'object', properties: { task_id: { type: 'string' }, lease_min: { type: 'number' } }, required: ['task_id'] },
     handler: function (a) {
       const r = S.claim(DB, AGENT, a.task_id, a.lease_min);
       S.heartbeat(DB, AGENT, r.ok ? 'busy' : 'idle');
@@ -165,31 +162,10 @@ const TOOLS = [
   },
   {
     name: 'bus_update',
-    description: '推进任务状态。允许迁移: claimed->in_progress->review->done，或任意->failed/cancelled。',
-    inputSchema: {
-      type: 'object',
-      properties: { task_id: { type: 'string' }, status: { type: 'string' }, note: { type: 'string' }, expect_version: { type: 'number' } },
-      required: ['task_id', 'status'],
-    },
     handler: function (a) { return S.updateTask(DB, AGENT, a.task_id, a.status, a.note, a.expect_version, policy.permissions.accept); },
   },
   {
     name: 'bus_dispatch',
-    description: '派活（结构化，服务端过五道守卫）。绝不要用 bus_send 假装派活。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        to: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, project: { type: 'string' },
-        write_scope: { type: 'array', items: { type: 'string' } },
-        grants: { type: 'array', maxItems: 5, items: { type: 'string', maxLength: 100, enum: KINDS } },
-        verify_id: { type: 'string', maxLength: 100, pattern: '^[a-z0-9._-]+$' },
-        verify_cmd: { type: 'string', maxLength: 1000 },
-        extra_dirs: { type: 'array', maxItems: 20, items: { type: 'string', maxLength: 500 } },
-        network_grants: { type: 'array', maxItems: 8, items: { type: 'object', properties: { protocol: { type: 'string', enum: ['http', 'https'] }, host: { type: 'string', maxLength: 253 }, ports: { type: 'array', maxItems: 16, items: { type: 'number' } }, purpose: { type: 'string', maxLength: 200 } }, required: ['protocol', 'host', 'ports', 'purpose'] } },
-        cost_class: { type: 'string' }, max_subagents: { type: 'number' }, depth: { type: 'number' },
-      },
-      required: ['to', 'title'],
-    },
     handler: function (a) {
       Object.assign(a, validateTaskFields(a));
       // grants 是本次派发放宽红线的白名单（kind 列表），可选；去掉它仍是旧的派发语义。
@@ -209,20 +185,14 @@ const TOOLS = [
   },
   {
     name: 'bus_decline',
-    description: '拒绝一个派来的任务，必须给理由。被派活的一方永远有拒绝权，不许沉默。',
-    inputSchema: { type: 'object', properties: { task_id: { type: 'string' }, reason: { type: 'string' } }, required: ['task_id', 'reason'] },
     handler: function (a) { return S.decline(DB, AGENT, a.task_id, a.reason, policy.permissions.accept); },
   },
   {
     name: 'bus_accept',
-    description: '批准一个待批任务（只有人类或 Lead 应该调用）。',
-    inputSchema: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
     handler: function (a) { return S.accept(DB, AGENT, a.task_id, policy.permissions.accept); },
   },
   {
     name: 'bus_override',
-    description: '人类放行一张红线任务：failed 的卡回到 review，并写入 guard_events 留痕。只有身份为 human 才能调用，其他 agent 一律 not_permitted。',
-    inputSchema: { type: 'object', properties: { task_id: { type: 'string' }, note: { type: 'string' } }, required: ['task_id'] },
     handler: function (a) {
       if (AGENT !== 'human') {
         return { ok: false, error: 'not_permitted', message: '红线任务只能由人类放行（当前身份 ' + AGENT + '）' };
@@ -237,18 +207,87 @@ const TOOLS = [
   },
   {
     name: 'bus_usage',
-    description: '报告本回合消耗的 token（按"谁消耗"记账，不是按任务 owner）。Lead 派活/验收的开销也要记在 Lead 名下。',
-    inputSchema: {
-      type: 'object',
-      properties: { task_id: { type: 'string' }, phase: { type: 'string' }, tokens_in: { type: 'number' }, tokens_out: { type: 'number' } },
-      required: ['tokens_in', 'tokens_out'],
-    },
     handler: function (a) { return S.recordUsage(DB, AGENT, a.task_id, a.phase, a.tokens_in, a.tokens_out); },
   },
   {
+    name: 'bus_reviews',
+    handler: function (a) {
+      const fn = storeFn('listReviews');
+      if (!fn) return { ok: false, error: 'not_available', message: 'store.listReviews 还没落地，评审队列暂不可用' };
+      const base = {};
+      if (a.status) base.status = a.status;
+      if (a.route) base.route = a.route;
+      if (a.task_id) base.task_id = a.task_id;
+      if (a.reviewer) base.reviewer = a.reviewer;
+      const lead = String(policy.lead || '');
+      let reviews;
+      try {
+        if (a.reviewer || AGENT === lead) reviews = fn(DB, base);
+        else {
+          // Worker 只看自己那份 + 还没被认领的 peer 队列；human/auto 路由不在 MCP 里排队。
+          const mine = fn(DB, Object.assign({}, base, { reviewer: AGENT }));
+          // 调用方只有在"要 active"或"要非 peer 路由"时才不该看到可认领的 peer 队列。
+          const wantsQueue = (!a.status || a.status === 'pending') && (!a.route || a.route === 'peer');
+          const queue = wantsQueue ? fn(DB, Object.assign({}, base, { status: 'pending', route: 'peer' })).filter(function (r) { return !r.reviewer; }) : [];
+          const seen = new Set();
+          reviews = [];
+          for (const r of mine.concat(queue)) { const key = String(r.id); if (seen.has(key)) continue; seen.add(key); reviews.push(r); }
+        }
+      } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+      return { ok: true, me: AGENT, reviews: Array.isArray(reviews) ? reviews : [] };
+    },
+  },
+  {
+    name: 'bus_claim_review',
+    handler: function (a) {
+      const fn = storeFn('claimReview');
+      if (!fn) return { ok: false, error: 'not_available', message: 'store.claimReview 还没落地，评审认领暂不可用' };
+      const row = reviewRowOf(a.review_id);
+      if (row && row.route === 'human') return { ok: false, reason: 'human_route_board_only', message: 'Human 路由的评审只能在看板由人处理，MCP 不暴露审批能力' };
+      try { return fn(DB, AGENT, a.review_id, a.expect_version); } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+    },
+  },
+  {
+    name: 'bus_submit_review',
+    handler: function (a) {
+      if (!Number.isSafeInteger(a.version) || a.version < 0) {
+        return { ok: false, reason: 'review_version_required', message: '提交评审必须带 review version（并发下的乐观锁，不能用 0 或缺省蒙过去）' };
+      }
+      const fn = storeFn('submitReview');
+      if (!fn) return { ok: false, error: 'not_available', message: 'store.submitReview 还没落地，评审提交暂不可用' };
+      const row = reviewRowOf(a.review_id);
+      if (row && row.route === 'human') return { ok: false, reason: 'human_route_board_only', message: 'Human 路由的评审只能在看板由人处理，MCP 不暴露审批能力' };
+      try { return fn(DB, AGENT, a.review_id, { verdict: a.verdict, summary: a.summary, version: a.version }); }
+      catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+    },
+  },
+  {
+    name: 'bus_merge_requests',
+    handler: function (a) {
+      const fn = storeFn('listMergeRequests');
+      if (!fn) return { ok: false, error: 'not_available', message: 'store.listMergeRequests 还没落地，合并队列暂不可用' };
+      let requests;
+      try {
+        requests = fn(DB, { project: a.project || undefined, status: a.status || undefined, open: a.open === true || undefined });
+      } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+      return { ok: true, me: AGENT, can_request: canRequestMerge(), approve_and_execute: 'human_on_board_only', requests: Array.isArray(requests) ? requests : [] };
+    },
+  },
+  {
+    name: 'bus_request_merge',
+    handler: function (a) {
+      const fn = storeFn('createMergeRequest');
+      if (!fn) return { ok: false, error: 'not_available', message: 'store.createMergeRequest 还没落地，暂时不能提出合并请求' };
+      if (!Array.isArray(a.task_ids) || !a.task_ids.length) return { ok: false, reason: 'no_tasks', message: '合并请求必须关联至少一个任务' };
+      let result;
+      try {
+        result = fn(DB, policy, AGENT, { project: a.project, task_ids: a.task_ids, source_ref: a.source_ref, target_ref: a.target_ref });
+      } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+      return Object.assign({ note: '已登记为 proposed：批准必须由 Human 在看板完成，执行由本地 merge runner 进行' }, result || {});
+    },
+  },
+  {
     name: 'bus_status',
-    description: '当前身份、生效的策略快照、成本汇总。',
-    inputSchema: { type: 'object', properties: {} },
     handler: function () {
       return {
         runtime: S.getRuntimeState(DB),
@@ -263,45 +302,75 @@ const TOOLS = [
 
 function byName(n) { return TOOLS.filter(function (t) { return t.name === n; })[0]; }
 
+// 版本号单一来源：package.json（与 bin/files/engines 同处）。以前这里手写 '0.1.0'，会和 agentbus version 分叉。
+const AGENTBUS_VERSION = (function () {
+  try { return String(JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8')).version || '0.0.0'); }
+  catch (error) { return '0.0.0'; }
+})();
+
 async function handle(msg) {
   const id = msg.id;
   const method = msg.method;
   if (method === 'initialize') {
     return { jsonrpc: '2.0', id: id, result: {
-      protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'agent-bus', version: '0.1.0' },
+      protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'agent-bus', version: AGENTBUS_VERSION },
     } };
   }
   if (method === 'tools/list') {
-    return { jsonrpc: '2.0', id: id, result: { tools: TOOLS.map(function (t) {
-      return { name: t.name, description: t.description, inputSchema: t.inputSchema };
-    }) } };
+    return { jsonrpc: '2.0', id: id, result: { tools: MCP.listTools() } };
   }
   if (method === 'tools/call') {
     const p = msg.params || {};
     freshPolicy();
     resolveIdentity();
     if (!AUTH.ok) {
-      return { jsonrpc: '2.0', id: id, result: textResult({
-        ok: false, reason: AUTH.reason, message: 'AgentBus 需要有效凭据（AGENT_BUS_TOKEN）；human 不签发 MCP 凭据',
-      }, true) };
+      return { jsonrpc: '2.0', id: id, result: MCP.toolResult(null, {
+        code: AUTH.reason || 'not_authenticated',
+        reason: AUTH.reason,
+        message: 'AgentBus 需要有效凭据（AGENT_BUS_TOKEN）；human 不签发 MCP 凭据',
+        remedy: 'agentbus credentials rotate <client> 后用 AGENT_BUS_TOKEN 启动 MCP',
+      }) };
     }
     const tool = byName(p.name);
     if (!tool) return { jsonrpc: '2.0', id: id, error: { code: -32601, message: 'unknown tool: ' + p.name } };
+    // strict 校验：拒绝未知字段/超长字符串/非整数，错误一次列全（不猜、不忽略）。
+    const checked = MCP.validateArgs(p.name, p.arguments || {});
+    if (!checked.ok) {
+      return { jsonrpc: '2.0', id: id, result: MCP.toolResult(null, {
+        code: 'invalid_arguments',
+        message: '参数不合法，共 ' + checked.errors.length + ' 处问题',
+        remedy: '按 tools/list 里的 inputSchema 传参；strict 模式不接受未声明字段',
+        details: checked.errors,
+      }) };
+    }
     try {
-      const a = p.arguments || {};
+      const a = checked.value;
       if (S.getRuntimeState(DB).enabled) { try { S.reapLeases(DB); } catch (e) {} }
       if (!S.getRuntimeState(DB).enabled && AGENT !== 'human') {
         const task = (a.task_id || a.thread) ? S.getTask(DB, a.task_id || a.thread) : null;
         const finishing = task && ['claimed', 'in_progress', 'review'].indexOf(task.status) >= 0;
-        const allowed = ['bus_runtime_status', 'bus_status', 'bus_tasks', 'bus_online', 'bus_renew_lease'].indexOf(p.name) >= 0 ||
+        const allowed = ['bus_runtime_status', 'bus_status', 'bus_tasks', 'bus_online', 'bus_renew_lease', 'bus_reviews', 'bus_merge_requests'].indexOf(p.name) >= 0 ||
           (p.name === 'bus_update' && finishing) || p.name === 'bus_usage' ||
           (p.name === 'bus_send' && finishing);
-        if (!allowed) return { jsonrpc: '2.0', id: id, result: textResult(S.runtimeDisabled(), true) };
+        if (!allowed) return { jsonrpc: '2.0', id: id, result: MCP.toolResult(null, Object.assign({}, S.runtimeDisabled(), {
+          code: 'runtime_disabled',
+          message: '总线处于关闭（排空）状态，只允许收尾类调用',
+          remedy: '让 Human 在看板重新启用总线',
+        })) };
       }
       const out = await tool.handler(a);
-      return { jsonrpc: '2.0', id: id, result: textResult(out, out && out.ok === false) };
+      if (out && out.ok === false) {
+        return { jsonrpc: '2.0', id: id, result: MCP.toolResult(null, {
+          code: out.code || out.error || out.reason || 'internal_error',
+          reason: out.reason,
+          message: out.message || '调用失败',
+          remedy: out.remedy,
+          details: out.details || null,
+        }) };
+      }
+      return { jsonrpc: '2.0', id: id, result: MCP.toolResult(out, null) };
     } catch (e) {
-      return { jsonrpc: '2.0', id: id, result: textResult({ ok: false, error: String(e && e.message || e) }, true) };
+      return { jsonrpc: '2.0', id: id, result: MCP.toolResult(null, { code: 'internal_error', message: String(e && e.message || e) }) };
     } finally {
       sweepReviews();
     }
@@ -313,19 +382,26 @@ async function handle(msg) {
 
 function writeOut(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
 
+// 请求是异步处理的：stdin 读到 EOF 时不能直接 exit，否则最后几条响应会被吞掉
+// （用文件/管道喂请求时尤其明显）。这里等在途请求清零再退出。
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
+let pending = 0;
+let closing = false;
+function maybeExit() { if (closing && pending === 0) process.exit(0); }
 rl.on('line', function (line) {
   const s = line.trim();
   if (!s) return;
   let msg;
   try { msg = JSON.parse(s); } catch (e) { return; }
+  pending++;
   Promise.resolve(handle(msg)).then(function (res) { if (res) writeOut(res); })
     .catch(function (e) {
       if (msg && typeof msg.id !== 'undefined') {
         writeOut({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: String(e && e.message || e) } });
       }
-    });
+    })
+    .finally(function () { pending--; maybeExit(); });
 });
-rl.on('close', function () { process.exit(0); });
+rl.on('close', function () { closing = true; maybeExit(); });
 
 process.stderr.write('[agent-bus] ' + AGENT + ' ready, db=' + argOf('db', S.DEFAULT_DB) + '\n');
