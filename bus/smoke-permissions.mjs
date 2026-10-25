@@ -21,7 +21,12 @@ const policy = S.loadPolicy();
 
 // ---------- [1] 平台权限：真实环境 + 注入桩 ----------
 const user = FP.currentUser();
-ok('能取到当前用户 SID', typeof user.sid === 'string' && /^S-1-\d+-\d+/.test(user.sid), user);
+if (process.platform === 'win32') {
+  ok('能取到当前用户 SID', typeof user.sid === 'string' && /^S-1-\d+-\d+/.test(user.sid), user);
+} else {
+  // POSIX 没有 SID 概念：要求取到用户名，且**不编造** SID（编一个假的比 null 更危险）。
+  ok('POSIX：能取到当前用户名且不编造 SID', typeof user.name === 'string' && user.name.length > 0 && user.sid === null, user);
+}
 const plainFile = path.join(temp, 'plain.json');
 fs.writeFileSync(plainFile, '{"a":1}\n');
 const realVerify = FP.verify(plainFile);
