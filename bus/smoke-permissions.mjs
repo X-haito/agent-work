@@ -13,7 +13,9 @@ import * as FP from './platform/file-permissions.mjs';
 let pass = 0, fail = 0;
 function ok(name, cond, detail) {
   if (cond) { pass++; console.log('PASS ' + name); return true; }
-  fail++; console.log('FAIL ' + name + (detail === undefined ? '' : ' :: ' + String(detail).slice(0, 300)));
+  // 对象用 JSON 打印：String(obj) 只会得到 [object Object]，CI 上等于没有信息。
+  const shown = detail === undefined ? '' : (typeof detail === 'string' ? detail : JSON.stringify(detail)).slice(0, 300);
+  fail++; console.log('FAIL ' + name + (shown ? ' :: ' + shown : ''));
   return false;
 }
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-perm-'));

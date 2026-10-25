@@ -143,12 +143,14 @@ export function verify(filePath, options) {
   const text = stripPaths(out.stdout, file);
   const entries = principalsOf(text);
   if (!entries.length) return { ok: false, method: 'icacls', detail: '解析不出任何 ACL 条目: ' + text.slice(0, 200) };
-  const self = [user.sid, user.name, user.name ? user.name.split('\\').pop() : null].filter(Boolean);
+  // Windows 的账户名比较不区分大小写（icacls 常输出 RUNNERADMIN\runneradmin，而 whoami 给 runneradmin\runneradmin）。
+  const lower = function (v) { return String(v || '').toLowerCase(); };
+  const self = [user.sid, user.name, user.name ? user.name.split('\\').pop() : null].filter(Boolean).map(lower);
   const others = [];
   let inherited = false;
   for (const entry of entries) {
     if (/\(I\)/.test(entry.rights) || /inherited/i.test(entry.rights)) inherited = true;
-    if (self.indexOf(entry.principal) < 0) others.push(entry.principal);
+    if (self.indexOf(lower(entry.principal)) < 0) others.push(entry.principal);
   }
   if (inherited) return { ok: false, method: 'icacls', detail: '仍存在继承来的 ACL（应关闭继承）' };
   if (others.length) return { ok: false, method: 'icacls', detail: '存在额外受托人: ' + Array.from(new Set(others)).slice(0, 5).join(', ') };
