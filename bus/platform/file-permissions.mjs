@@ -83,6 +83,13 @@ export function harden(filePath, options) {
   }
   const user = options && options.user ? options.user : currentUser({ run: run });
   if (!user || !user.sid) return { ok: false, method: 'icacls', detail: '取不到当前用户 SID，拒绝假装加固成功' };
+  // /inheritance:r 只移除**继承来的** ACE；文件创建时从父目录显式复制过来的
+  // SYSTEM / Administrators 仍会留下（CI 上实测 verify 报「存在额外受托人」）。
+  // 先 /reset 让 ACL 回到纯继承状态，再 /inheritance:r 清空，最后只授当前用户。
+  const reset = run('icacls', [file, '/reset']);
+  if (reset.status !== 0) {
+    return { ok: false, method: 'icacls', detail: '重置 ACL 失败: ' + String(reset.stderr || reset.stdout || reset.error || '').slice(0, 300) };
+  }
   const strip = run('icacls', [file, '/inheritance:r']);
   if (strip.status !== 0) {
     return { ok: false, method: 'icacls', detail: '关闭继承失败: ' + String(strip.stderr || strip.stdout || strip.error || '').slice(0, 300) };
