@@ -8,6 +8,17 @@ import path from 'node:path';
 import * as S from './store.mjs';
 import { buildPlan } from './archive.mjs';
 
+// CI 上如果这里抛异常，默认只会看到「Process completed with exit code 1」。
+// 统一兜底打印栈与环境信息，让失败原因出现在日志里。
+process.on('uncaughtException', function (error) {
+  console.error('UNCAUGHT: ' + (error && error.stack || error));
+  console.error('ENV: platform=' + process.platform + ' cwd=' + process.cwd() + ' git=' + (function () { try { return cp.execSync('git --version').toString().trim(); } catch (e) { return 'missing'; } })());
+  process.exit(1);
+});
+process.on('unhandledRejection', function (error) {
+  console.error('UNHANDLED: ' + (error && error.stack || error));
+  process.exit(1);
+});
 let pass = 0, fail = 0;
 function ok(name, cond, extra) {
   if (cond) { pass++; console.log('  PASS  ' + name); }

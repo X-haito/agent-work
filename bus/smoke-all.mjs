@@ -112,7 +112,10 @@ function runSuite(file) {
       }
       resolve({ name: name, pass: counts.pass == null ? 0 : counts.pass, fail: counts.fail == null ? 0 : counts.fail,
         status: status, reason: reason, exit_code: code == null ? null : code, duration_ms: duration,
-        detail: status === 'passed' ? null : combined.replace(/\s+/g, ' ').trim().slice(0, 400) });
+        // 失败详情保留尾部 2000 字符：套件的真正错误几乎总在最后（之前的 400 字符+压缩空白
+        // 会把 FAIL 行和异常栈切掉，CI 日志里只剩「exit code 1」）。
+        detail: status === 'passed' ? null : (combined.replace(/\s+/g, ' ').trim().slice(-2000) || null),
+        detail_tail: status === 'passed' ? null : combined.split('\n').slice(-25).join('\n') });
     }
     // 超时要连子进程树一起收掉：套件自己可能开了 server/子进程，只 kill 自己会留孤儿。
     function killTree() {
@@ -199,7 +202,12 @@ async function main() {
     if (decision.required_skips.length) console.log('必需套件被 SKIP（视为失败）: ' + decision.required_skips.join(', '));
     if (failed.length) {
       console.log('失败套件:');
-      for (const r of failed) console.log('  - ' + r.name + '（' + (r.reason || r.status) + '）' + (r.detail ? ' :: ' + r.detail.slice(0, 200) : ''));
+      for (const r of failed) {
+        console.log('  - ' + r.name + '（' + (r.reason || r.status) + '）');
+        // CI 日志里必须能直接看到失败原因：打印尾部若干行，而不是压缩后截断。
+        const tail = r.detail_tail || r.detail || '';
+        if (tail) console.log(tail.split('\n').map(function (line) { return '      | ' + line; }).join('\n'));
+      }
     }
   }
   if (!decision.ok) process.exitCode = 1;
