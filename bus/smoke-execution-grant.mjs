@@ -46,7 +46,7 @@ try {
     const result=S.issueExecutionGrant(db,c.id,'worker/main',{task_version:c.version,probe:VALID_PROBE});assert(result.ok,JSON.stringify(result));
     // 必须与生产用同一个规范化函数：fs.realpathSync 不解析 Windows 8.3 短名（RUNNER~1），
     // .native 才解析成长名（runneradmin）。用弱的那个比强的那个，Windows CI 上必然不等。
-    const canon=(p)=>{try{return fs.realpathSync.native(p)}catch(e){return fs.realpathSync(p)}};
+    const canon=(p)=>{try{return fs.realpathSync.native(p)}catch(e){try{return path.join(fs.realpathSync.native(path.dirname(p)),path.basename(p))}catch(e2){try{return fs.realpathSync(p)}catch(e3){return p}}}};
     assert.deepEqual(result.grant.roots,[canon(project),canon(outside)]);
     assert.deepEqual(result.grant.redline,['cfg:edit','fs:delete']);
     assert.equal(result.grant.task_version,c.version);
@@ -110,7 +110,7 @@ try {
     assert.equal(normalizeRoots({projectRoot:project,cwd:project,extraDirs:['broken']}).ok,false);
   });
   check('missing final cwd is canonical when parent exists',()=>{
-    const result=normalizeRoots({projectRoot:project,cwd:path.join(project,'new-worker'),extraDirs:[outside,outside]});assert(result.ok);assert.deepEqual(result.roots,[path.join(fs.realpathSync(project),'new-worker'),fs.realpathSync(outside)]);
+    const result=normalizeRoots({projectRoot:project,cwd:path.join(project,'new-worker'),extraDirs:[outside,outside]});assert(result.ok);assert.deepEqual(result.roots,[path.join(fs.realpathSync.native(project),'new-worker'),fs.realpathSync.native(outside)]);
   });
   check('old schema migrates idempotently without losing tasks',()=>{
     const legacyPath=path.join(tmp,'legacy.db');const legacy=new DatabaseSync(legacyPath);let schema=fs.readFileSync(path.join(S.BUS_DIR,'schema.sql'),'utf8');
