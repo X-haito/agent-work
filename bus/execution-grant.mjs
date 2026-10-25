@@ -43,8 +43,15 @@ export function normalizeRoots({ projectRoot, cwd, extraDirs = [] } = {}) {
       noTraversal(value);
       const absolute = path.isAbsolute(value) ? path.normalize(value) : path.resolve(root, value);
       const real = realDirectory(absolute, true);
+      // Windows CI 的临时目录是 8.3 短名（C:\Users\RUNNER~1\...），canonical 会解析成长名
+      // （C:\Users\runneradmin\...）——同一目录字符串却不相等，lexical 比较会误判成逃逸。
+      // 所以比较前也把声明路径规范化一次（解析不了就退回父目录规范化 + 文件名）。
+      let absoluteCmp = absolute;
+      try { absoluteCmp = canonical(absolute); } catch (e) {
+        try { absoluteCmp = path.join(canonical(path.dirname(absolute)), path.basename(absolute)); } catch (e2) { absoluteCmp = absolute; }
+      }
       if (index === 0 || !path.isAbsolute(value)) {
-        if (!contained(root, absolute) || !contained(root, real)) throw new Error('工作区或相对路径符号链接逃逸项目根: ' + value);
+        if (!contained(root, absoluteCmp) || !contained(root, real)) throw new Error('工作区或相对路径符号链接逃逸项目根: ' + value);
       } else {
         const parent = canonical(path.dirname(absolute));
         if (!contained(parent, real)) throw new Error('额外目录符号链接逃逸: ' + value);

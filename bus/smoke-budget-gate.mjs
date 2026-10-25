@@ -23,6 +23,8 @@ const STUDIED = ['claude-supervisor.mjs', 'codex-supervisor.mjs'];
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-budget-'));
 
 function sliceFunction(source, header) {
+  // Windows 检出可能是 CRLF：先归一化，否则 '\n}\n' 永远找不到边界。
+  source = String(source).replace(/\r\n/g, '\n');
   const start = source.indexOf(header);
   assert(start >= 0, '找不到：' + header);
   const end = source.indexOf('\n}\n', start);
@@ -30,6 +32,7 @@ function sliceFunction(source, header) {
   return source.slice(start, end + 3);
 }
 function sliceBetween(source, header, tail) {
+  source = String(source).replace(/\r\n/g, '\n');
   const start = source.indexOf(header);
   const end = source.indexOf(tail, start);
   assert(start >= 0 && end > start, '边界变了：' + header);

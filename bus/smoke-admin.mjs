@@ -417,6 +417,7 @@ console.log('\n[6d] 归档面板前端逻辑（vm 抽真源码 + DOM 桩）');
   return '';
 }
 function sliceFn(source, header, tail) {
+  source = String(source).replace(/\r\n/g, '\n');
     const start = source.indexOf(header);
     const end = source.indexOf(tail, start);
     return source.slice(start, end);

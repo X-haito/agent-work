@@ -1268,15 +1268,22 @@ async function runWorktreeList(options) {
   const repo = o.repo || path.resolve(S.BUS_DIR, '..');
   const listed = await gitRun(['worktree', 'list', '--porcelain'], repo);
   if (listed.code !== 0) return { ok: false, reason: 'git_failed', message: String(listed.stderr || '').slice(0, 400) };
-  const root = worktreeRoot(repo).replace(/\\/g, '/');
+  // Windows CI：临时目录是 8.3 短名（RUNNER~1），而 git 报长名（runneradmin）；
+  // 同时 porcelain 输出是 CRLF。两边都归一化后再做前缀比较，否则列表恒为空。
+  const canon = function (value) {
+    const raw = String(value == null ? '' : value).trim();
+    try { return fs.realpathSync.native(raw); } catch (e) { try { return fs.realpathSync(raw); } catch (e2) { return raw; } }
+  };
+  const norm = function (value) { return canon(value).replace(/\\/g, '/').toLowerCase(); };
+  const root = norm(worktreeRoot(repo));
   const entries = [];
   let current = null;
-  for (const line of String(listed.stdout).split('\n')) {
-    if (line.indexOf('worktree ') === 0) { current = { path: line.slice('worktree '.length) }; entries.push(current); }
-    else if (current && line.indexOf('branch ') === 0) current.branch = line.slice('branch '.length).replace('refs/heads/', '');
+  for (const line of String(listed.stdout).split(/\r?\n/)) {
+    if (line.indexOf('worktree ') === 0) { current = { path: line.slice('worktree '.length).trim() }; entries.push(current); }
+    else if (current && line.indexOf('branch ') === 0) current.branch = line.slice('branch '.length).trim().replace('refs/heads/', '');
     else if (current && line.trim() === 'bare') current.bare = true;
   }
-  const ours = entries.filter(function (e) { return String(e.path).replace(/\\/g, '/').indexOf(root) === 0; });
+  const ours = entries.filter(function (e) { return norm(e.path).indexOf(root) === 0; });
   return { ok: true, repo: repo, root: worktreeRoot(repo), worktrees: ours, all_count: entries.length };
 }
 

@@ -1,0 +1,11 @@
+# 统一换行：源码与文本文件在仓库里始终是 LF。
+# 否则 Windows runner 会按 autocrlf 检出成 CRLF，而多处测试按 \n 做源码切片，
+# 会报「函数边界变了」这类假失败（CI 上真实发生过）。
+* text=auto eol=lf
+
+# 二进制/数据文件不要做换行转换
+*.png binary
+*.jpg binary
+*.gz binary
+*.db binary
+*.sqlite binary
