@@ -13,7 +13,9 @@ let pass = 0;
 function check(name, fn) { fn(); pass++; console.log('PASS ' + name); }
 function reject(input, pattern) { assert.throws(() => A.createProject(input, options), pattern); }
 const actualRegistry = path.join(BUS_DIR, 'projects.json');
-const actualSnapshot = fs.readFileSync(actualRegistry, 'utf8');
+// CI 上 bus/projects.json 是运行时数据、不在仓库里（本地有所以掩盖了这个假设）。
+const readActualRegistry = () => (fs.existsSync(actualRegistry) ? fs.readFileSync(actualRegistry, 'utf8') : null);
+const actualSnapshot = readActualRegistry();
 try {
   fs.mkdirSync(bus);
   // 隔离夹具：动态镜像 bus/ 下所有 *.mjs 与 *.sql（含子目录、排除 smoke*.mjs），
@@ -153,7 +155,7 @@ try {
     assert.equal(fs.readFileSync(malformed.path, 'utf8'), '{broken');
   });
   check('production registry remains byte-for-byte unchanged', () => {
-    assert.equal(fs.readFileSync(actualRegistry, 'utf8'), actualSnapshot);
+    assert.equal(readActualRegistry(), actualSnapshot, '真实 projects.json 被改动了');
   });
   console.log('PASS ' + pass + '   FAIL 0');
 } finally { fs.rmSync(tmp, { recursive: true, force: true }); }

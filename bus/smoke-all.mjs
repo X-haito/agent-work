@@ -115,7 +115,13 @@ function runSuite(file) {
         // 失败详情保留尾部 2000 字符：套件的真正错误几乎总在最后（之前的 400 字符+压缩空白
         // 会把 FAIL 行和异常栈切掉，CI 日志里只剩「exit code 1」）。
         detail: status === 'passed' ? null : (combined.replace(/\s+/g, ' ').trim().slice(-2000) || null),
-        detail_tail: status === 'passed' ? null : combined.split('\n').slice(-25).join('\n') });
+        // 优先列出 FAIL/异常行（它们可能远在尾部 25 行之外），再补尾部上下文。
+        detail_tail: status === 'passed' ? null : (function () {
+          const lines = combined.split('\n');
+          const bad = lines.filter(function (l) { return /FAIL|UNCAUGHT|UNHANDLED|Error:|AssertionError/.test(l); }).slice(0, 20);
+          const tail = lines.slice(-15);
+          return Array.from(new Set(bad.concat(tail))).join('\n');
+        })() });
     }
     // 超时要连子进程树一起收掉：套件自己可能开了 server/子进程，只 kill 自己会留孤儿。
     function killTree() {

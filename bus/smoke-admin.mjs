@@ -491,7 +491,13 @@ function sliceFn(source, header, tail) {
 }
 
 console.log('项目管理 API');
-const originalRegistry = fs.readFileSync(path.join(S.BUS_DIR, 'projects.json'), 'utf8');
+// CI 上 bus/projects.json 可能根本不存在（运行时数据不入库）：按内容比较，缺文件视为空登记表。
+const registryPath = path.join(S.BUS_DIR, 'projects.json');
+function projectsRegistrySnapshot() {
+  if (!fs.existsSync(registryPath)) return {};
+  try { return (JSON.parse(fs.readFileSync(registryPath, 'utf8')) || {}).projects || {}; } catch (e) { return { unreadable: true }; }
+}
+const originalRegistry = projectsRegistrySnapshot();
 const projectPost = body => fetch(apiUrl + '/api/projects', { method: 'POST', headers, body: JSON.stringify(body) });
 const projectDelete = id => fetch(apiUrl + '/api/projects/' + encodeURIComponent(id), { method: 'DELETE', headers, body: '{}' });
 ok('项目写操作要求 CSRF', (await fetch(apiUrl + '/api/projects', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status === 403);
@@ -524,7 +530,7 @@ ok('删除清理生成配置并解除登记', removed.status === 200 && !fs.exis
 ok('删除保留目录与用户文件', fs.statSync(autoBody.project.path).isDirectory() && fs.readFileSync(userFile, 'utf8') === '用户文件保留');
 const projectState = await (await fetch(apiUrl + '/api/state')).json();
 ok('state项目列表与管理能力', projectState.project_management && projectState.project_registry.some(p => p.id === dirtyProject && !p.registered));
-ok('临时注册不改真实文件', fs.readFileSync(path.join(S.BUS_DIR, 'projects.json'), 'utf8') === originalRegistry);
+ok('临时注册不改真实登记表（按内容比较；CI 上文件可能本就不存在）', JSON.stringify(projectsRegistrySnapshot()) === JSON.stringify(originalRegistry));
 ok('项目页可选路径与未登记标记', html.includes('id="page-projects"') && html.includes('id="pf-path" placeholder=') && html.includes('未登记'));
 
 console.log('任务验证与授权字段');
