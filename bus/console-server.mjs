@@ -263,7 +263,9 @@ function logsOverview(db) {
       unmanaged_bytes: inventory.totals.unmanaged_bytes,
       truncated: inventory.totals.files >= 200,
       unmanaged_sample: inventory.unmanaged.slice(0, 20).map(function (row) {
-        return { relative_path: row.relative_path, bytes: row.bytes, reason: row.reason };
+        // 第 3 项：样本也带 confidence/basis —— 看板上"为什么归不了户"要能追溯
+        return { relative_path: row.relative_path, size: row.size, status: row.status, confidence: row.confidence,
+          reason: row.reason, inferred_task_id: row.inferred_task_id, basis_detail: row.basis && row.basis.detail };
       }),
       scanned_at: inventory.scanned_at,
     };

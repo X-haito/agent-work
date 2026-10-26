@@ -145,23 +145,28 @@ const inv = Logs.buildInventory(db, { logsDir: logsDir });
 ok('inventory 扫到全部文件', inv.totals.files === 6, inv.totals);
 ok('已登记且 hash 一致 → verified',
   inv.managed.some(r => r.relative_path === taskA.id + '-covered.log' && r.verified === true && r.reason === 'artifact_refs'));
-ok('路径里带 task id 的旧日志能可靠归属', inv.managed.some(r => r.relative_path === taskA.id + '-build.log' && r.task_id === taskA.id && r.reason === 'path'));
-ok('内容里只有唯一 task id 也能归属', inv.managed.some(r => r.relative_path === 'compile-output.log' && r.task_id === taskA.id && r.reason === 'content'));
+// 第 3 项的新口径：字段叫 inferred_task_id；路径唯一 + 内容无冲突 = high（可导入）
+ok('路径里带唯一 task id 的旧日志 → high 可导入',
+  inv.managed.some(r => r.relative_path === taskA.id + '-build.log' && r.inferred_task_id === taskA.id && r.confidence === 'high' && r.importable === true));
+// 只有内容一个来源 → medium：日志"提到"某个 task 不等于是"属于"它，不自动归户（只建议人工复核）
+ok('内容里只有唯一 task id → medium，仅建议复核、不自动归户',
+  inv.entries.some(r => r.relative_path === 'compile-output.log' && r.confidence === 'medium' && r.reason === 'content_only' && r.importable === false && r.needs_review === true));
 const unmanagedNames = inv.unmanaged.map(r => r.relative_path);
 ok('内容里有多个 task id → 不猜，标 unmanaged', unmanagedNames.indexOf('mixed.log') >= 0, unmanagedNames);
 ok('二进制文件不猜归属', unmanagedNames.indexOf('blob.bin') >= 0, unmanagedNames);
 ok('完全没有 task id 的 → unmanaged', unmanagedNames.indexOf('orphan.log') >= 0, unmanagedNames);
-ok('unmanaged 计数与字节数如实给出', inv.totals.unmanaged === 3 && inv.totals.unmanaged_bytes === inv.unmanaged.reduce((n, r) => n + r.bytes, 0), inv.totals);
+ok('unmanaged 计数与字节数如实给出（字段名统一为 size）',
+  inv.totals.unmanaged === 4 && inv.totals.unmanaged_bytes === inv.unmanaged.reduce((n, r) => n + r.size, 0), inv.totals);
 
 // import：只写引用表，不删文件
 const imported = Logs.importInventory(db, { logsDir: logsDir });
-ok('import 把可靠归属的旧日志写成 artifact_refs', imported.ok === true && imported.totals.imported === 2, imported.totals);
-ok('import 不给 unmanaged 写引用', imported.totals.unmanaged === 3 && imported.unmanaged.length === 3, imported.unmanaged);
+ok('import 只写 high 的（路径唯一那份），内容-only 的 medium 不写', imported.ok === true && imported.totals.imported === 1, imported.totals);
+ok('import 不给 unmanaged 写引用', imported.totals.unmanaged === 4 && imported.unmanaged.length === 4, imported.unmanaged.map(function (x) { return x.relative_path; }));
 ok('import 不删除任何文件（红线）', fs.existsSync(logByPath) && fs.existsSync(logByContent) && fs.existsSync(logNoLink) && fs.existsSync(logBinary));
 const after = Logs.buildInventory(db, { logsDir: logsDir });
-ok('import 后这些文件变成 verified 归属',
-  after.managed.filter(r => r.verified === true).length === 3, after.managed.map(r => [r.relative_path, r.verified]));
-ok('unmanaged 数量不受 import 影响', after.totals.unmanaged === 3);
+ok('import 后已登记文件（2 个）都是 verified 归属',
+  after.managed.filter(r => r.verified === true).length === 2, after.managed.map(r => [r.relative_path, r.verified, r.confidence]));
+ok('unmanaged 数量不受 import 影响', after.totals.unmanaged === 4);
 
 // hash 被改 → 不能算 verified（也不再是可删候选）
 fs.writeFileSync(registered, 'tampered\n');

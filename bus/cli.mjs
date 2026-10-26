@@ -402,19 +402,37 @@ function logs() {
   console.log('日志 inventory（只读，不删除任何文件）');
   console.log('  目录: ' + inventory.root);
   console.log('  扫描: ' + inventory.totals.files + ' 个文件 / ' + inventory.totals.bytes + ' 字节');
-  console.log('  可归属: ' + inventory.totals.managed + ' 个（其中 hash 未核对 ' + inventory.totals.unverified + ' 个）');
-  console.log('  不可归属(unmanaged): ' + inventory.totals.unmanaged + ' 个 / ' + inventory.totals.unmanaged_bytes + ' 字节 —— 只上报，绝不删除');
-  for (const row of inventory.unmanaged.slice(0, 30)) {
-    console.log('    ! ' + row.relative_path + '  ' + row.bytes + 'B  原因: ' + row.reason);
+  console.log('  已登记(managed): ' + inventory.totals.managed + ' 个，其中哈希一致(verified) ' + inventory.totals.verified + ' 个');
+  console.log('  可导入(high): ' + inventory.totals.importable + ' 个 · 待人工复核(medium): ' + inventory.totals.needs_review + ' 个');
+  console.log('  无法归属(unmanaged_unknown): ' + inventory.totals.unmanaged + ' 个 / ' + inventory.totals.unmanaged_bytes + ' 字节 —— 保留原文件、不进 retention、无批量删除入口');
+  if (inventory.import_suggestions.length) {
+    console.log('');
+    console.log('  导入建议（依据可审计）:');
+    for (const row of inventory.import_suggestions.slice(0, 20)) {
+      console.log('    + ' + row.relative_path + ' → ' + row.task_id + '  [' + row.confidence + '] ' + row.basis.detail);
+    }
   }
-  if (inventory.unmanaged.length > 30) console.log('    …还有 ' + (inventory.unmanaged.length - 30) + ' 个（--json 看全部）');
-  for (const row of inventory.managed.filter(function (x) { return x.verified !== true; }).slice(0, 10)) {
-    console.log('    ? ' + row.relative_path + '  归属 ' + row.task_id + ' 但 ' + row.reason);
+  if (inventory.review_suggestions.length) {
+    console.log('');
+    console.log('  需要人工复核（单一来源，不自动归户）:');
+    for (const row of inventory.review_suggestions.slice(0, 20)) {
+      console.log('    ? ' + row.relative_path + (row.inferred_task_id ? ' → 疑似 ' + row.inferred_task_id : '') + '  [' + row.reason + '] ' + row.basis.detail);
+    }
+    if (inventory.review_suggestions.length > 20) console.log('    …还有 ' + (inventory.review_suggestions.length - 20) + ' 个（--json 看全部）');
+  }
+  if (inventory.unmanaged.length) {
+    console.log('');
+    console.log('  无法归属明细（保留原文件）:');
+    for (const row of inventory.unmanaged.slice(0, 20)) {
+      console.log('    ! ' + row.relative_path + '  ' + row.size + 'B  [' + row.confidence + '/' + row.reason + '] ' + row.basis.detail);
+    }
+    if (inventory.unmanaged.length > 20) console.log('    …还有 ' + (inventory.unmanaged.length - 20) + ' 个（--json 看全部）');
   }
   if (importResult) {
     console.log('');
-    console.log('import: 新增引用 ' + importResult.totals.imported + ' 条 · 失败 ' + importResult.totals.failed +
-      ' 条 · unmanaged 仍为 ' + importResult.totals.unmanaged + ' 条（未写引用）');
+    console.log('import: 新增引用 ' + importResult.totals.imported + ' 条 · 跳过 ' + importResult.totals.skipped +
+      ' 条 · 失败 ' + importResult.totals.failed + ' 条 · unmanaged_unknown 仍为 ' + importResult.totals.unmanaged + ' 条（未写引用、未删除）');
+    for (const f of importResult.failed.slice(0, 10)) console.log('    ! ' + f.relative_path + ' → ' + f.reason);
   }
 }
 // 升级（escalation）：查看未解除的升级，或由 Lead/Human 放行。

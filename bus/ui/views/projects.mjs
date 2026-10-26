@@ -27,7 +27,7 @@ function renderRetentionLayers(){
   var when=function(v){return v?esc(fmt(v)):'—'};
   var unmanagedList=(lg&&lg.unmanaged_sample&&lg.unmanaged_sample.length)
     ? '<ul class="report-evidence">'+lg.unmanaged_sample.map(function(x){
-        return '<li><code>'+esc(x.relative_path)+'</code> · '+bytes(x.bytes)+' · '+esc(x.reason||'—')+'</li>';
+        return '<li><code>'+esc(x.relative_path)+'</code> · '+bytes(x.size)+' · 置信 '+esc(x.confidence||'—')+' · '+esc(x.reason||'—')+(x.basis_detail?' · '+esc(x.basis_detail):'')+'</li>';
       }).join('')+'</ul>'
     : '<p class="help">没有不可归属的日志'+(lg&&lg.truncated?'（本样本已截断，详见 logs inventory）':'')+'</p>';
   el.hidden=false;
