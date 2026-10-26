@@ -28,6 +28,7 @@ function argValue(name, fallback) {
   return fallback;
 }
 import { decide, CI_REQUIRED_SUITES, normalizeSuiteName } from './smoke-support/summary.mjs';
+import { suiteEnv, allocatePort } from './smoke-support/env.mjs';
 
 const JSON_MODE = process.argv.indexOf('--json') >= 0;
 const STRICT = process.argv.indexOf('--strict') >= 0;
@@ -41,24 +42,9 @@ const REQUIRED = (function () {
 })();
 const TIMEOUT_MS = Math.max(1, Number(argValue('timeout', 120)) || 120) * 1000;
 
-// 子进程的隔离环境：独立 HOME/USERPROFILE、独立 DB/registry 路径，并清掉调用者的身份，
-// 免得某个套件读到本进程的凭据或配置。绝大多数套件本来就自己建临时库。
-function suiteEnv(dir) {
-  const env = Object.assign({}, process.env);
-  env.HOME = dir;
-  env.USERPROFILE = dir;
-  env.BUS_DB = path.join(dir, 'bus.db');
-  env.BUS_PROJECTS = path.join(dir, 'projects.json');
-  // HOME 换了以后 git 读不到 ~/.gitconfig：用环境变量给一个身份，否则依赖 git commit/merge 的套件会假失败。
-  env.GIT_AUTHOR_NAME = 'smoke-all';
-  env.GIT_AUTHOR_EMAIL = 'smoke-all@localhost';
-  env.GIT_COMMITTER_NAME = 'smoke-all';
-  env.GIT_COMMITTER_EMAIL = 'smoke-all@localhost';
-  delete env.AGENT_BUS_TOKEN;
-  delete env.AGENT_BUS_ID;
-  return env;
-}
-
+// 第 11 项：子进程的隔离环境统一由 smoke-support/env.mjs 生成 ——
+// 独立 HOME/USERPROFILE + BUS_DB/BUS_PROJECTS/BUS_POLICY_PATH/BUS_LIFECYCLE + 动态端口 + AGENTBUS_TEST_GUARD=1。
+// 端口遵守"允许 listen(0)、禁止写死"：父进程先拿空闲端口，再通过 AGENTBUS_TEST_PORT 传给子进程。
 // 两种输出格式：'PASS n   FAIL m' 与 'smoke-routing: n passed'
 function parseCounts(text) {
   const body = String(text || '');
@@ -77,7 +63,7 @@ function looksLikeEperm(text) {
   return /spawn EPERM|code:\s*'EPERM'|EPERM/.test(String(text || ''));
 }
 
-function runSuite(file) {
+function runSuite(file, portForSuite) {
   const name = path.basename(file);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-all-' + name.replace(/[^a-z0-9]+/gi, '-') + '-'));
   const outFile = path.join(dir, 'stdout.txt');
@@ -137,8 +123,10 @@ function runSuite(file) {
     try {
       fdOut = fs.openSync(outFile, 'w');
       fdErr = fs.openSync(errFile, 'w');
+      // 关卡端口要在 spawn 前拿到：用同步保留的"已分配端口"（见 allocatePorts 预分配），
+      // 这样 spawn 仍是同步调用，不需要把 runSuite 整个改成 async。
       child = cp.spawn(process.execPath, [file], {
-        cwd: ROOT, env: suiteEnv(dir), stdio: ['ignore', fdOut, fdErr], windowsHide: true, shell: false,
+        cwd: ROOT, env: suiteEnv(dir, { port: portForSuite }), stdio: ['ignore', fdOut, fdErr], windowsHide: true, shell: false,
         detached: process.platform !== 'win32',   // 非 Windows 下开进程组，超时才能整棵树收掉
       });
       child.on('error', function (error) { finish(null, looksLikeEperm(String(error && error.message || error)) ? 'skipped' : 'failed'); });
@@ -173,7 +161,8 @@ async function main() {
   const results = [];
   const startedAll = Date.now();
   for (const file of suites) {
-    const result = await runSuite(file);
+    const suitePort = await allocatePort();
+    const result = await runSuite(file, suitePort);
     results.push(result);
     if (!JSON_MODE) {
       const tag = result.status === 'passed' ? 'PASS  ' : result.status === 'skipped' ? 'SKIP  ' : result.status === 'timeout' ? 'TIME  ' : 'FAIL  ';

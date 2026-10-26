@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import * as S from './store.mjs';
+import { assertIsolated } from './smoke-support/isolation-guard.mjs';
 import * as A from './admin-config.mjs';
 import * as Auth from './auth.mjs';
 import * as boardUi from './board-ui.mjs';
@@ -786,7 +787,11 @@ export function createBoardServer(options) {
 //   components: board/codex/claude/dsh 的 pid/started_at/version/nonce/心跳
 //   restart_required: [{component, reason, required_hash, created_at}]
 // 清除规则只有一条：**看到组件真的重启了**（board 是新 started_at；MCP 客户端是它自己的心跳晚于 created_at）。
-export const LIFECYCLE_FILE = process.env.BUS_LIFECYCLE || path.join(S.BUS_DIR, 'lifecycle.json');
+export const LIFECYCLE_FILE = (function () {
+  const file = process.env.BUS_LIFECYCLE || path.join(S.BUS_DIR, 'lifecycle.json');
+  // 第 11 项：这里正是 task-67 那次"测试写进真实 lifecycle.json"的入口，现在过守卫。
+  return assertIsolated('lifecycle', file, 'lifecycle 路径落到了真实文件；测试请设 BUS_LIFECYCLE。');
+})();
 export const LIFECYCLE_COMPONENTS = ['board', 'codex', 'claude', 'dsh'];
 const COMPONENT_AGENT = { codex: 'codex/main', claude: 'claude/main', dsh: 'dsh/main' };
 

@@ -9,6 +9,7 @@ import { normalizeGrant, normalizeNetworkPolicy } from './network-policy.mjs';
 import { applyPolicyDefaults, unknownPolicyPaths } from './policy-schema.mjs';
 import { authReadiness, openDb } from './store.mjs';
 import * as FilePermissions from './platform/file-permissions.mjs';
+import { assertIsolated } from './smoke-support/isolation-guard.mjs';
 
 const AGENT_RE = /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*$/i;
 const AUTONOMY = ['off', 'propose', 'auto'];
@@ -306,7 +307,9 @@ const PROJECT_TOPOLOGIES = ['clone-per-agent', 'shared', 'isolated'];
 
 function projectOptions(options) {
   const opts = options || {};
-  return { registry: opts.path || path.join(BUS_DIR, 'projects.json'),
+  const registryPath = opts.path || process.env.BUS_PROJECTS || path.join(BUS_DIR, 'projects.json');
+  assertIsolated('projects', registryPath, '读到了真实 projects.json；测试请设 BUS_PROJECTS。');
+  return { registry: registryPath,
     workspaceRoot: opts.workspaceRoot || path.resolve(BUS_DIR, '..', 'workspaces') };
 }
 

@@ -17,6 +17,8 @@ import * as Auth from './auth.mjs';
 export const BUS_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(BUS_DIR, '..');
 export const DEFAULT_DB = path.join(BUS_DIR, 'bus.db');
+// 第 11 项隔离合同：生产代码里只 import 一个纯函数，不做任何 IO。
+import { assertIsolated } from './smoke-support/isolation-guard.mjs';
 export const POLICY_PATH = path.join(BUS_DIR, 'policy.json');
 
 export const TERMINAL = ['done', 'failed', 'declined', 'cancelled'];
@@ -181,7 +183,11 @@ function parseArray(text) {
 }
 
 export function openDb(dbPath) {
-  const p = dbPath || DEFAULT_DB;
+  // BUS_DB 是测试/多实例的标准入口（smoke-all 就是靠它注入临时库）；以前这里只认参数，
+  // 于是 openDb() 永远打到真实库 —— 第 11 项把这条也纳入合同。
+  const p = dbPath || process.env.BUS_DB || DEFAULT_DB;
+  // AGENTBUS_TEST_GUARD=1 时，指向真实 bus/bus.db 一律立即抛错（这正是我们踩过的第一次事故）。
+  assertIsolated('db', p, 'openDb() 默认路径就是真实库；测试请显式传临时路径或设 BUS_DB。');
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const db = new DatabaseSync(p);
   pragma(db, 'PRAGMA journal_mode = WAL');
@@ -375,6 +381,7 @@ export function runtimeDisabled() {
 export function loadPolicy(p) {
   // BUS_POLICY_PATH 让测试能用临时策略，不污染真实配置
   const file = p || process.env.BUS_POLICY_PATH || POLICY_PATH;
+  assertIsolated('policy', file, 'loadPolicy() 读到了真实 policy.json；测试请设 BUS_POLICY_PATH。');
   // 读写两条路径共用同一份 schema（policy-schema.mjs）：读的时候也补默认值，
   // 否则"删掉某字段"在运行时就等于"没有默认值"，和保存路径的语义对不上。
   const policy = applyPolicyDefaults(JSON.parse(fs.readFileSync(file, 'utf8')));
