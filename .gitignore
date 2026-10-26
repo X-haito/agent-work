@@ -1,4 +1,6 @@
 # 运行时状态，不入库
+# lifecycle.json 存 PID/启动时间/重启标记：每次跑 status/start 都会变，属于运行数据
+bus/lifecycle.json
 bus/bus.db
 bus/bus.db-wal
 bus/bus.db-shm
