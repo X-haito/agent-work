@@ -245,3 +245,13 @@ AgentBus 仍是本地优先的早期版本。身份认证、严格执行隔离�
 - 两种写法**不等价**：静态 import 会冻结模块层路径（`LIFECYCLE_FILE` 等），守卫会在使用点抛错；bootstrap 从根上避免这件事。
 - `AGENTBUS_TEST_GUARD=1` 下，任何指向真实 `bus.db` / `policy.json` / `projects.json` / `lifecycle.json` 的解析都立即抛 `IsolationError`。
 - 套件环境由 `bus/smoke-support/env.mjs` 的 `suiteEnv(dir,{port})` 生成：独立临时目录 + 四个状态变量 + 动态端口（`listen(0)`，禁止写死）。
+## 许可证
+
+本项目使用 **Apache License 2.0**，全文见仓库根目录的 [`LICENSE`](./LICENSE)。
+
+- 允许商用、修改、分发、私用，并附带专利授权；
+- 分发时须保留版权与许可声明，修改过的文件须注明「已修改」；
+- 附带免责声明，不提供任何担保。
+
+`package.json` 的 `files` 白名单已包含 `LICENSE`，`npm pack` 产物会带上它。
+

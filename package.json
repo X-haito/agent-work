@@ -2,6 +2,7 @@
   "name": "agentbus",
   "version": "1.0.0",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "description": "AgentBus：本地多 Agent 协同总线（任务/评审/合并/预算/归档看板）",
   "bin": {
@@ -16,6 +17,7 @@
     "bus/mcp/**/*.mjs",
     "bus/ui/*.css",
     "README.md",
+    "LICENSE",
     "package.json",
     "bus/policy.example.json"
   ],
