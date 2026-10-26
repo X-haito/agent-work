@@ -59,3 +59,10 @@
 ## 状态词
 
 定义见 [README.md](../README.md) 的「状态词」一节；本表与 README 必须同时出现 implemented / wired / enabled / verified 四个词。
+
+## 第 7 项：真实浏览器验收（待 CI 证据）
+
+- 套件：`bus/smoke-browser.mjs`（零依赖 CDP，Chrome/Edge 自动探测，找不到就 SKIP）。
+- 本机：沙箱禁止命名管道，Chrome/Edge 均无法启动 → 套件 SKIP（`sandbox_blocks_named_pipes`），**不伪装通过**。
+- 通过标准：`node bus/smoke-browser.mjs --require-browser` 在能跑浏览器的环境全绿（SKIP 视为失败）。
+- 回滚开关 `AGENTBUS_UI_INLINE` 与 `bus/ui/app.js`：**保留**，理由见 `bus/ui/ROLLBACK.md` 同名小节。

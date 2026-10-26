@@ -3,7 +3,9 @@
 //   · failed 套件、断言失败 > 0            → 失败
 //   · skipped 且该套件在 required 列表里   → 失败（CI 里 SKIP 不能当 PASS）
 //   · --strict 时任何 skipped              → 失败
-export const CI_REQUIRED_SUITES = ['smoke-e2e', 'smoke-auth', 'smoke-permissions', 'smoke-verifier', 'smoke-install'];
+// smoke-browser / smoke-auth-process（第 7、4B 项）：唯一能证明「浏览器真的能跑」与
+// 「真实 MCP 进程认证有效」的证据源。它们在 CI 里被跳过而整体仍绿 = 证据永远不存在，所以进必需清单。
+export const CI_REQUIRED_SUITES = ['smoke-e2e', 'smoke-auth', 'smoke-permissions', 'smoke-verifier', 'smoke-install', 'smoke-browser', 'smoke-auth-process'];
 
 export function normalizeSuiteName(name) {
   return String(name || '').replace(/\.mjs$/, '');

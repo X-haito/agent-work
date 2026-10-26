@@ -59,6 +59,15 @@ function parseCounts(text) {
   return { pass: pass, fail: fail };
 }
 
+// 套件级 SKIP 约定（第 7 项）：套件自己知道"这一步在本机做不到"时，
+// 打印一行 SKIP_SUITE: <reason> 并以 0 退出。整棵树必须显示"跳过"而不是"通过"——
+// 断言级 SKIP 只是少了几条断言，套件级 SKIP 会让整棵树看起来是绿的，更危险。
+const SKIP_SUITE_RE = /(?:^|\n)SKIP_SUITE:\s*([A-Za-z0-9_.:-]+)/;
+function skipSuiteReason(text) {
+  const m = String(text || '').match(SKIP_SUITE_RE);
+  return m ? m[1] : null;
+}
+
 function looksLikeEperm(text) {
   return /spawn EPERM|code:\s*'EPERM'|EPERM/.test(String(text || ''));
 }
@@ -88,7 +97,10 @@ function runSuite(file, portForSuite) {
       let status = 'passed';
       let reason = null;
       if (failureReason) { status = failureReason; }
-      else if (looksLikeEperm(combined) && (counts.pass == null || code !== 0)) {
+      else if (code === 0 && skipSuiteReason(combined)) {
+        // 套件显式声明"本机做不到"：记 skipped，绝不记 PASS。
+        status = 'skipped'; reason = skipSuiteReason(combined);
+      } else if (looksLikeEperm(combined) && (counts.pass == null || code !== 0)) {
         // 套件内部的子进程被沙箱拒绝：记 SKIP，绝不记 PASS。
         status = 'skipped'; reason = 'spawn_eperm';
       } else if (code !== 0) { status = 'failed'; }

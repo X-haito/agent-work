@@ -244,6 +244,9 @@ AgentBus 仍是本地优先的早期版本。身份认证、严格执行隔离�
 - 老套件沿用显式临时路径（`S.openDb(tmp)` / 自己设 `BUS_*`），由运行期守卫兜底。
 - 两种写法**不等价**：静态 import 会冻结模块层路径（`LIFECYCLE_FILE` 等），守卫会在使用点抛错；bootstrap 从根上避免这件事。
 - `AGENTBUS_TEST_GUARD=1` 下，任何指向真实 `bus.db` / `policy.json` / `projects.json` / `lifecycle.json` 的解析都立即抛 `IsolationError`。
+- **套件级 SKIP**：某一步在本机确实做不到时，套件打印 `SKIP_SUITE: <reason>` 并以 0 退出；
+  `smoke-all` 会把它记成 `skipped`（不是 `passed`），`--strict` / `--profile ci` / `--require` 下视为失败。
+  断言级 SKIP 只是少几条断言，套件级 SKIP 会让整棵树看起来是绿的——两者都必须显式可见。
 - 套件环境由 `bus/smoke-support/env.mjs` 的 `suiteEnv(dir,{port})` 生成：独立临时目录 + 四个状态变量 + 动态端口（`listen(0)`，禁止写死）。
 ## 许可证
 

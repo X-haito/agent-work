@@ -23,7 +23,11 @@ jobs:
         run: node --check bus/cli.mjs
       # 用人类可读模式跑：失败时日志直接显示哪个套件红、哪条断言失败。
       # --json 会把所有输出压成一坨，CI 日志里反而看不出原因。
+      # AGENTBUS_REQUIRE_BROWSER=1：CI runner 自带 Chrome 且不禁命名管道，
+      # 所以「浏览器起不来」在 CI 里必须是 FAIL 而不是 SKIP——否则判据 1 永远拿不到证据。
       - name: 全量测试（CI profile：必需套件被跳过即失败）
         run: node bus/smoke-all.mjs --profile ci
+        env:
+          AGENTBUS_REQUIRE_BROWSER: '1'
       - name: 发布包检查
         run: node bus/cli.mjs release-check --skip-smoke
