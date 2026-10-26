@@ -31,6 +31,15 @@ fs.writeFileSync(POLICY, JSON.stringify({
 }, null, 2));
 process.env.BUS_POLICY_PATH = POLICY;
 
+// 第 8 项：Peer 评审候选现在按项目资格过滤 → 必须先把项目登记进 registry（并声明参与 agent）。
+// 这也是本套件要验证的新语义：未登记的项目**不会**从全局池里补人。
+const REGISTRY = path.join(tmp, 'projects.json');
+const PROJECT_DIR = path.join(tmp, 'proj-review');
+fs.mkdirSync(PROJECT_DIR, { recursive: true });
+fs.writeFileSync(REGISTRY, JSON.stringify({ projects: { 'proj-review': { path: PROJECT_DIR, agents: ['worker/main', 'peer/main'] } } }, null, 2));
+process.env.BUS_PROJECTS = REGISTRY;
+const oldProjectsEnv = process.env.BUS_PROJECTS;
+
 const db = S.openDb(path.join(tmp, 'bus.db'));
 S.setRuntimeState(db, 'human', true);
 const policy = S.loadPolicy();
@@ -235,6 +244,105 @@ try {
   ok('按 route 过滤', humanOnly.length >= 2 && humanOnly.every(function (r) { return r.route === 'human'; }));
   ok('open 只看 pending/active', S.listReviews(db, { open: true }).every(function (r) { return ['pending', 'active'].indexOf(r.status) >= 0; }));
   ok('按项目过滤', S.listReviews(db, { project: 'proj-review' }).length >= 3);
+  console.log('');
+  console.log('[8] Peer 候选的项目资格过滤（policy ∩ project ∩ online − owner − lead）');
+  const PR = await import('./project-registry.mjs');
+  const readReg = function () { return PR.readRegistry(REGISTRY); };
+  const onlineBoth = function () { S.heartbeat(db, 'worker/main', 'idle'); S.heartbeat(db, 'peer/main', 'idle'); };
+  onlineBoth();
+
+  const unregTask = S.createTask(db, { title: '未登记项目', status: 'open', project: 'not-registered', cost_class: 'standard' });
+  cleanGuard(unregTask.id);
+  S.claim(db, 'worker/main', unregTask.id, 15);
+  S.updateTask(db, 'worker/main', unregTask.id, 'in_progress');
+  const unregReview = S.updateTask(db, 'worker/main', unregTask.id, 'review', '未登记项目待评审');
+  ok('未登记项目不为 peer 指派 reviewer', unregReview.ok === true && unregReview.review && unregReview.review.reviewer === null, unregReview.review && unregReview.review.reviewer);
+  ok('未登记项目保留 pending 而不是随机补人', unregReview.review.status === 'pending', unregReview.review.status);
+  ok('并一次性升级 Human（review_unassigned）', db.prepare("SELECT COUNT(*) AS c FROM task_escalations WHERE task_id=? AND kind='review_unassigned'").get(unregTask.id).c === 1);
+  S.updateTask(db, 'worker/main', unregTask.id, 'review', '再来一次');
+  ok('重复进入 review 不会产生第二条升级', db.prepare("SELECT COUNT(*) AS c FROM task_escalations WHERE task_id=? AND kind='review_unassigned'").get(unregTask.id).c === 1);
+
+  const onlyLeadDir = path.join(tmp, 'proj-only-lead');
+  fs.mkdirSync(onlyLeadDir, { recursive: true });
+  const regOnlyLead = readReg();
+  regOnlyLead.projects['proj-only-lead'] = { path: onlyLeadDir, agents: ['lead/main'] };
+  fs.writeFileSync(REGISTRY, JSON.stringify(regOnlyLead, null, 2));
+  const leadOnlyTask = S.createTask(db, { title: '项目只有 lead', status: 'open', project: 'proj-only-lead', cost_class: 'standard' });
+  cleanGuard(leadOnlyTask.id);
+  S.claim(db, 'worker/main', leadOnlyTask.id, 15);
+  S.updateTask(db, 'worker/main', leadOnlyTask.id, 'in_progress');
+  const leadOnlyReview = S.updateTask(db, 'worker/main', leadOnlyTask.id, 'review');
+  ok('项目内只有 Lead 时不指派 peer', leadOnlyReview.review && leadOnlyReview.review.reviewer === null, leadOnlyReview.review && leadOnlyReview.review.reviewer);
+
+  const offlineTask = S.createTask(db, { title: '候选全离线', status: 'open', project: 'proj-review', cost_class: 'standard' });
+  cleanGuard(offlineTask.id);
+  db.prepare("UPDATE presence SET status='offline' WHERE agent_id IN ('worker/main','peer/main')").run();
+  S.claim(db, 'worker/main', offlineTask.id, 15);
+  S.updateTask(db, 'worker/main', offlineTask.id, 'in_progress');
+  const offlineReview = S.updateTask(db, 'worker/main', offlineTask.id, 'review');
+  ok('项目候选全离线时不指派（也不从全局池补人）', offlineReview.review && offlineReview.review.reviewer === null, offlineReview.review && offlineReview.review.reviewer);
+  onlineBoth();
+
+  const hotDir = path.join(tmp, 'proj-hot');
+  fs.mkdirSync(hotDir, { recursive: true });
+  fs.writeFileSync(path.join(hotDir, 'project.json'), JSON.stringify({ agents: ['peer/main'] }));
+  const regHot = readReg();
+  regHot.projects['proj-hot'] = { path: hotDir };
+  fs.writeFileSync(REGISTRY, JSON.stringify(regHot, null, 2));
+  const hotTask = S.createTask(db, { title: '热更新项目', status: 'open', project: 'proj-hot', cost_class: 'standard' });
+  cleanGuard(hotTask.id);
+  S.claim(db, 'worker/main', hotTask.id, 15);
+  S.updateTask(db, 'worker/main', hotTask.id, 'in_progress');
+  const hotReview = S.updateTask(db, 'worker/main', hotTask.id, 'review');
+  ok('project.json 声明的人可以被指派（registry 条目没写 agents 也认）', hotReview.review && hotReview.review.reviewer === 'peer/main', hotReview.review && hotReview.review.reviewer);
+  fs.writeFileSync(path.join(hotDir, 'project.json'), JSON.stringify({ agents: [] }));
+  const hotTask2 = S.createTask(db, { title: '热更新后为空', status: 'open', project: 'proj-hot', cost_class: 'standard' });
+  cleanGuard(hotTask2.id);
+  S.claim(db, 'worker/main', hotTask2.id, 15);
+  S.updateTask(db, 'worker/main', hotTask2.id, 'in_progress');
+  const hotReview2 = S.updateTask(db, 'worker/main', hotTask2.id, 'review');
+  ok('project.json 改成空数组后不再指派（热更新生效）', hotReview2.review && hotReview2.review.reviewer === null, hotReview2.review && hotReview2.review.reviewer);
+
+  const report = PR.eligibleAgents({ policy: policy, registry: readReg(), task: { project: 'proj-review', owner: 'worker/main' }, online: ['worker/main', 'peer/main', 'lead/main'] });
+  ok('owner 被排除', report.eligible.indexOf('worker/main') < 0, report.eligible);
+  ok('lead 被排除', report.eligible.indexOf('lead/main') < 0, report.eligible);
+  ok('剩下的是 project ∩ online ∩ policy 的交集', JSON.stringify(report.eligible) === JSON.stringify(['peer/main']), report.eligible);
+  ok('policy 里没有的人即使项目声明了也不候选',
+    PR.eligibleAgents({ policy: policy, registry: readReg(), task: { project: 'proj-review' }, online: ['worker/main', 'peer/main', 'stranger/main'] }).eligible.indexOf('stranger/main') < 0);
+  ok('在线列表为空 → no_online_worker',
+    PR.eligibleAgents({ policy: policy, registry: readReg(), task: { project: 'proj-review' }, online: [] }).reason === 'no_online_worker');
+
+  console.log('');
+  console.log('[9] max_concurrent：claimed 也占执行槽');
+  const slotPolicy = JSON.parse(fs.readFileSync(POLICY, 'utf8'));
+  slotPolicy.agents['cap/main'] = { autonomy: 'auto', may_dispatch_to: [], max_open_from_agents: 50, max_concurrent: 1 };
+  fs.writeFileSync(POLICY, JSON.stringify(slotPolicy, null, 2));
+  const capA = S.createTask(db, { title: '槽位A', status: 'open', project: 'proj-review', target: 'cap/main' });
+  const capB = S.createTask(db, { title: '槽位B', status: 'open', project: 'proj-review', target: 'cap/main' });
+  const firstClaim = S.claim(db, 'cap/main', capA.id, 15);
+  const secondClaim = S.claim(db, 'cap/main', capB.id, 15);
+  ok('claimed（还没 in_progress）就占满 max_concurrent=1', firstClaim.ok === true && secondClaim.ok === false && secondClaim.reason === 'max_concurrent', secondClaim);
+  S.updateTask(db, 'cap/main', capA.id, 'in_progress');
+  const thirdClaim = S.claim(db, 'cap/main', capB.id, 15);
+  ok('claimed→in_progress 不会重复计数', thirdClaim.ok === false && thirdClaim.reason === 'max_concurrent', thirdClaim);
+  S.updateTask(db, 'cap/main', capA.id, 'review');
+  const afterReview = S.claim(db, 'cap/main', capB.id, 15);
+  ok('review 不占执行槽 → 可以继续认领', afterReview.ok === true, afterReview);
+  // capB 现在占着 cap/main 唯一的槽；先让它离开执行态，才能单独验证"过期 lease 会被回收"
+  // claimed 只能走 in_progress → review（cancel 只允许从 open/proposed 出发，这是既有状态机的约定）
+  S.updateTask(db, 'cap/main', capB.id, 'in_progress');
+  const releasedB = S.updateTask(db, 'cap/main', capB.id, 'review', '腾出槽位做下一个断言');
+  ok('把 capB 推进到 review 后 cap/main 槽位归零', releasedB.ok === true &&
+    Number(db.prepare("SELECT COUNT(*) AS c FROM tasks WHERE owner='cap/main' AND status IN ('claimed','in_progress')").get().c) === 0);
+  const staleLeaseTask = S.createTask(db, { title: '过期占用', status: 'open', project: 'proj-review', target: 'cap/main' });
+  S.claim(db, 'cap/main', staleLeaseTask.id, 1);
+  db.prepare("UPDATE tasks SET lease_until=? WHERE id=?").run('2000-01-01T00:00:00.000Z', staleLeaseTask.id);
+  const capC = S.createTask(db, { title: '槽位C', status: 'open', project: 'proj-review', target: 'cap/main' });
+  const afterStale = S.claim(db, 'cap/main', capC.id, 15);
+  ok('过期 lease 在同一个事务里被回收，配额不会被锁死', afterStale.ok === true, afterStale);
+  ok('被回收的任务回到 open 且 owner 清空', (function () { const row = S.getTask(db, staleLeaseTask.id); return row.status === 'open' && !row.owner; })());
+
+
 } finally {
   db.close();
   if (oldPolicyEnv === undefined) delete process.env.BUS_POLICY_PATH; else process.env.BUS_POLICY_PATH = oldPolicyEnv;

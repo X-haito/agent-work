@@ -182,6 +182,20 @@ try {
   S.updateTask(db, 'cap/main', capTask.id, 'review');
   const afterRelease = S.claim(db, 'cap/main', task().id, 15);
   ok('任务离开执行态后可以继续认领', afterRelease.ok === true, afterRelease);
+  // 先把 afterRelease 那张卡推进到 review，腾出 cap/main 的唯一槽位
+  S.updateTask(db, 'cap/main', afterRelease.task.id, 'in_progress');
+  S.updateTask(db, 'cap/main', afterRelease.task.id, 'review');
+  // 第 9 项：口径改成 claimed + in_progress —— 只 claim 不开始也占槽（否则"先抢后做"能绕开配额）
+  const heldClaim = S.claim(db, 'cap/main', task().id, 15);
+  const whileHeld = S.claim(db, 'cap/main', task().id, 15);
+  ok('claimed 就占满 max_concurrent=1（不必等 in_progress）',
+    heldClaim.ok === true && whileHeld.ok === false && whileHeld.reason === 'max_concurrent', whileHeld);
+  S.updateTask(db, 'cap/main', heldClaim.task.id, 'in_progress');
+  const stillHeld = S.claim(db, 'cap/main', task().id, 15);
+  ok('claimed→in_progress 不重复计数（仍是 1 个槽）', stillHeld.ok === false && stillHeld.reason === 'max_concurrent', stillHeld);
+  S.updateTask(db, 'cap/main', heldClaim.task.id, 'review');
+  const freed = S.claim(db, 'cap/main', task().id, 15);
+  ok('离开执行态后槽位释放', freed.ok === true, freed);
   // 本轮修正：以前"查不到配置就不限额"等于任意自报身份都能绕过 max_concurrent。
   const ghostClaim = S.claim(db, 'ghost/main', task().id, 15);
   ok('未在策略登记的 agent 被拒绝而不是绕过配额', ghostClaim.ok === false && ghostClaim.reason === 'unknown_agent', ghostClaim);
