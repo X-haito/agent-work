@@ -130,6 +130,22 @@ try {
   ok('同一计划重复执行不会二次删除', (again.ok === true || again.reason === 'plan_stale' || again.reason === 'nothing_to_do'), again);
   ok('B 的用量仍为 1（重复执行没有波及）', db.prepare('SELECT COUNT(*) AS c FROM token_usage WHERE id = ?').get(usageB).c === 1);
 
+  console.log('[9] fence：屏障内被接管后旧 worker 不得提交');
+  const taskC = seedTask('proj-a', 'C 的旧任务');
+  const planC = buildPlan(db, policy, { project: 'proj-a', archiveDir, logsDir, now: NOW });
+  let bumped = null;
+  const takenOver = applyArchive(db, policy, planC, {
+    confirm: planC.plan_hash, project: 'proj-a', archiveDir, logsDir, now: NOW,
+    hooks: { duringBarrier: function () {
+      // 模拟另一个 worker 在这期间接管了租约：换 holder 并递增 fence_token
+      db.prepare("INSERT INTO archive_leases(id,holder,acquired_at,expires_at,note,fence_token) VALUES('archive','other-worker',?,?,NULL,99) " +
+        'ON CONFLICT(id) DO UPDATE SET holder=excluded.holder, fence_token=excluded.fence_token').run(NOW.toISOString(), new Date(NOW.getTime() + 3600000).toISOString());
+      bumped = db.prepare("SELECT fence_token FROM archive_leases WHERE id='archive'").get().fence_token;
+    } },
+  });
+  ok('被接管后 apply 失败且 reason=lease_lost', takenOver.ok === false && takenOver.reason === 'lease_lost', takenOver);
+  ok('旧 worker 没有删掉任何任务（C 仍在库里）', db.prepare('SELECT COUNT(*) AS c FROM tasks WHERE id = ?').get(taskC.id).c === 1, { fence: bumped });
+
   console.log('[8] 全库计划仍然包含孤儿用量（对照）');
   const globalPlan = buildPlan(db, policy, { archiveDir, logsDir, now: NOW });
   ok('全库计划的 scope 是 global', globalPlan.scope && globalPlan.scope.type === 'global', globalPlan.scope);

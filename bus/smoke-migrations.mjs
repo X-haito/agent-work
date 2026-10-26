@@ -61,8 +61,9 @@ try {
   console.log('');
   console.log('[2] schema_migrations 台账');
   check('当前代码里有 7 个按版本排序的步骤定义，checksum 都是 64 位十六进制', () => {
-    assert.equal(PLAN.length, 8, JSON.stringify(PLAN.map(function (p) { return p.version; })));
-    assert.deepEqual(PLAN.map(function (p) { return p.version; }), [1, 2, 3, 4, 5, 6, 7, 8]);
+    // 版本清单从代码派生，不写死数字：加一个迁移步骤不需要改测试
+    assert.ok(PLAN.length >= 8, JSON.stringify(PLAN.map(function (p) { return p.version; })));
+    assert.deepEqual(PLAN.map(function (p) { return p.version; }), PLAN.map(function (p, i) { return i + 1; }));
     assert.ok(PLAN.every(function (p) { return /^[0-9a-f]{64}$/.test(p.checksum) && p.name && p.file; }), JSON.stringify(PLAN[0]));
     assert.deepEqual(PLAN.map(function (p) { return p.checksum; }), migrationPlan().map(function (p) { return p.checksum; }), 'checksum 不稳定');
   });
@@ -70,7 +71,7 @@ try {
     const db = new DatabaseSync(path.join(dir, 'reg-a.db'));
     try {
       const result = migrateDb(db);
-      assert.deepEqual(result.applied, [1, 2, 3, 4, 5, 6, 7, 8]);
+      assert.deepEqual(result.applied, PLAN.map(function (p) { return p.version; }));
       const rows = db.prepare('SELECT version, name, applied_at, checksum FROM schema_migrations ORDER BY version').all();
       assert.equal(rows.length, PLAN.length);
       assert.ok(rows.every(function (r) { return /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/.test(r.applied_at) && /^[0-9a-f]{64}$/.test(r.checksum) && r.name; }), JSON.stringify(rows[0]));

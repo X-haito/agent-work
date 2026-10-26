@@ -198,7 +198,10 @@ CREATE TABLE IF NOT EXISTS archive_leases (
   holder      TEXT NOT NULL,
   acquired_at TEXT NOT NULL,
   expires_at  TEXT NOT NULL,
-  note        TEXT
+  note        TEXT,
+  -- 第 10 项长尾：单调递增的 fencing token。每次获取/接管租约都换新值，
+  -- 旧 worker 即使租约过期后恢复，也必须因为 token 不匹配而无法提交。
+  fence_token INTEGER NOT NULL DEFAULT 0
 );
 
 -- 日志引用：只有引用任务已归档且文件 hash 一致时才允许删除

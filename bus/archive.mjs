@@ -337,7 +337,7 @@ export function unmanagedSummary(db, policy, options) {
 // ---------------------------------------------------------------- 租约
 
 export function readArchiveLease(db) {
-  try { return db.prepare('SELECT holder, acquired_at, expires_at, note FROM archive_leases WHERE id = ?').get(LEASE_ID) || null; }
+  try { return db.prepare('SELECT holder, acquired_at, expires_at, note, fence_token FROM archive_leases WHERE id = ?').get(LEASE_ID) || null; }
   catch (error) { return null; }
 }
 
@@ -357,15 +357,32 @@ export function acquireArchiveLease(db, holder, policy, options) {
       if (started) db.exec('ROLLBACK');
       return { ok: false, reason: 'lease_busy', holder: row.holder, expires_at: row.expires_at };
     }
-    db.prepare('INSERT INTO archive_leases(id,holder,acquired_at,expires_at,note) VALUES(?,?,?,?,?) ' +
-      'ON CONFLICT(id) DO UPDATE SET holder = excluded.holder, acquired_at = excluded.acquired_at, expires_at = excluded.expires_at, note = excluded.note')
+    // 每次获取/接管都换新 fence_token：旧 worker 恢复后 token 必然不匹配，无法提交。
+    db.prepare('INSERT INTO archive_leases(id,holder,acquired_at,expires_at,note,fence_token) VALUES(?,?,?,?,?,1) ' +
+      'ON CONFLICT(id) DO UPDATE SET holder = excluded.holder, acquired_at = excluded.acquired_at, expires_at = excluded.expires_at, note = excluded.note, ' +
+      'fence_token = COALESCE(archive_leases.fence_token, 0) + 1')
       .run(LEASE_ID, holder, nowText, expiresAt, o.note == null ? null : String(o.note).slice(0, 200));
+    const fresh = readArchiveLease(db);
+    const fence = fresh ? Number(fresh.fence_token) || 0 : 0;
     if (started) db.exec('COMMIT');
-    return { ok: true, holder: holder, acquired_at: nowText, expires_at: expiresAt, ttl_min: ttl };
+    return { ok: true, holder: holder, acquired_at: nowText, expires_at: expiresAt, ttl_min: ttl, fence_token: fence };
   } catch (error) {
     if (started) { try { db.exec('ROLLBACK'); } catch (inner) { /* ignore */ } }
     return { ok: false, reason: 'lease_error', message: String((error && error.message) || error) };
   }
+}
+
+// 提交前复核：租约必须仍由本人持有、token 未变、且未过期。
+// 这是「超时或失去租约的 worker 不能继续 apply」的唯一保证。
+export function verifyArchiveLeaseFence(db, holder, fenceToken, options) {
+  const o = options || {};
+  const nowText = (o.now ? new Date(o.now) : new Date()).toISOString();
+  const row = readArchiveLease(db);
+  if (!row) return { ok: false, reason: 'lease_lost', detail: '租约已不存在（可能被释放或接管）' };
+  if (String(row.holder) !== String(holder)) return { ok: false, reason: 'lease_lost', detail: '租约已被 ' + row.holder + ' 接管' };
+  if (Number(row.fence_token) !== Number(fenceToken)) return { ok: false, reason: 'lease_lost', detail: 'fence_token 已变（' + row.fence_token + ' ≠ ' + fenceToken + '），旧 worker 不得提交' };
+  if (String(row.expires_at) <= nowText) return { ok: false, reason: 'lease_expired', detail: '租约已过期: ' + row.expires_at };
+  return { ok: true, fence_token: Number(row.fence_token) };
 }
 
 export function releaseArchiveLease(db, holder) {
@@ -719,6 +736,7 @@ export function applyArchive(db, policy, plan, options) {
   const created = [];
   let inBarrier = false;
   let leaseHeld = false;
+  let fenceToken = null;
   let committed = false;
   let snapshotPath = null;
 
@@ -737,6 +755,7 @@ export function applyArchive(db, policy, plan, options) {
       return { ok: false, reason: 'lease_busy', holder: lease.holder, expires_at: lease.expires_at };
     }
     leaseHeld = true;
+    fenceToken = lease.fence_token;
 
     // 3) 屏障内校验计划（id / 版本 / 源库完整性），任何偏差整批中止
     const check = validatePlanLocked(db, plan);
@@ -764,7 +783,15 @@ export function applyArchive(db, policy, plan, options) {
       bundles.push(materializeBundle(archiveDir, payload, { archived_at: now.toISOString(), plan_hash: plan.plan_hash, policy_hash: plan.policy_hash, schema_hash: plan.schema_hash }, created));
     }
 
-    // 6) 事务内：写 task_archives → 聚合 usage → 按精确 id 删原始行
+    // 6) 提交前复核 fence：租约若已过期被接管、或 token 变了，旧 worker 一律不得提交。
+    const fenceCheck = verifyArchiveLeaseFence(db, holder, fenceToken, { now: now });
+    if (!fenceCheck.ok) {
+      releaseDrain(db, false); inBarrier = false;
+      auditQuiet(db, { actor: 'system', auth_method: 'archive', action: 'archive.failed', resource: { reason: fenceCheck.reason, detail: fenceCheck.detail } });
+      return { ok: false, reason: fenceCheck.reason, message: fenceCheck.detail, plan_hash: plan.plan_hash };
+    }
+
+    // 7) 事务内：写 task_archives → 聚合 usage → 按精确 id 删原始行
     applyLocked(db, plan, bundles, now, deleted);
     const finish = releaseDrain(db, true);
     if (!finish.ok) throw new Error('commit_failed: ' + (finish.message || finish.reason));
