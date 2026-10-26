@@ -768,6 +768,14 @@ function cleanupFiles(list) {
 function defaultHolder() { return 'archive:' + process.pid; }
 
 // 审计在损坏的库上会抛错；失败路径不能因为写不了审计而丢掉真正的原因
+// 屏障顺序取证：hooks.event(name, payload, at) 记录时刻，供测试断言
+// 「integrity 完成」严格早于「进入屏障」。没有这个取证，"移出屏障"只是说法。
+function emitHook(options, name, payload) {
+  const hook = options && options.hooks && options.hooks.event;
+  if (typeof hook !== 'function') return;
+  try { hook(String(name), payload || {}, Date.now()); } catch (error) { /* 钩子不许影响生产路径 */ }
+}
+
 function auditQuiet(db, entry) {
   try { return logAudit(db, entry); } catch (error) { return { ok: false }; }
 }
@@ -806,36 +814,40 @@ export function applyArchive(db, policy, plan, options) {
   try {
     fs.mkdirSync(archiveDir, { recursive: true });
 
-    // 1) drain：等当前写事务结束，并把之后的写入挡在门外
-    const drain = acquireDrain(db, o);
-    if (!drain.ok) return { ok: false, reason: drain.reason, message: drain.message };
-    inBarrier = true;
-
-    // 2) 单例租约（在屏障内判定并占用，天然串行）
+    // 1) 单例租约（屏障外）：拿到 fence_token。接管只可能发生在屏障之外。
     const lease = acquireArchiveLease(db, holder, policy, { now: now, note: 'plan ' + plan.plan_hash.slice(0, 12) });
-    if (!lease.ok) {
-      releaseDrain(db, false); inBarrier = false;
-      return { ok: false, reason: 'lease_busy', holder: lease.holder, expires_at: lease.expires_at };
-    }
+    if (!lease.ok) return { ok: false, reason: 'lease_busy', holder: lease.holder, expires_at: lease.expires_at };
     leaseHeld = true;
     fenceToken = lease.fence_token;
 
-    // 3) 屏障内校验计划（id / 版本 / 源库完整性），任何偏差整批中止
-    const check = validatePlanLocked(db, plan);
-    if (!check.ok) {
-      releaseDrain(db, false); inBarrier = false;
-      auditQuiet(db, { actor: 'system', auth_method: 'archive', action: 'archive.failed', resource: { reason: check.reason, detail: check.detail || null, integrity: check.integrity || null, plan_hash: plan.plan_hash }, result: 'failed' });
-      return check;
+    // 2) 完整性预检 + 一致性快照（**屏障之外**）：大库 integrity_check 可能很慢，
+    //    此时还没有屏障，不会挡住任何写入。屏障只留给最后的短事务。
+    const precheck = validatePlanLocked(db, plan);
+    if (!precheck.ok) {
+      auditQuiet(db, { actor: 'system', auth_method: 'archive', action: 'archive.failed', resource: { reason: precheck.reason, detail: precheck.detail || null, integrity: precheck.integrity || null, plan_hash: plan.plan_hash }, result: 'failed' });
+      return precheck;
     }
-
-    // 4) 一致性快照 + 完整性校验（不通过绝不动数据库）
     const snapshot = takeSnapshot(db, o, now);
     if (!snapshot.ok) {
-      releaseDrain(db, false); inBarrier = false;
       auditQuiet(db, { actor: 'system', auth_method: 'archive', action: 'archive.failed', resource: { reason: snapshot.reason, integrity: snapshot.integrity || null, detail: snapshot.message || null, snapshot: snapshot.snapshot_path ? path.basename(snapshot.snapshot_path) : null }, result: 'failed' });
       return snapshot;
     }
     snapshotPath = snapshot.path;
+    emitHook(o, 'snapshot_done', { path: snapshot.path });
+    emitHook(o, 'integrity_done', { integrity: 'ok' });
+
+    // 3) 进入写屏障：只做 revision/hash/fence 复核 + 短事务删除
+    const drain = acquireDrain(db, o);
+    if (!drain.ok) return { ok: false, reason: drain.reason, message: drain.message };
+    inBarrier = true;
+    emitHook(o, 'barrier_in', { waited_ms: drain.waited_ms });
+    const check = validatePlanLocked(db, plan);
+    if (!check.ok) {
+      releaseDrain(db, false); inBarrier = false;
+      emitHook(o, 'barrier_out', { committed: false });
+      auditQuiet(db, { actor: 'system', auth_method: 'archive', action: 'archive.failed', resource: { reason: check.reason, detail: check.detail || null, integrity: check.integrity || null, plan_hash: plan.plan_hash }, result: 'failed' });
+      return check;
+    }
     if (o.hooks && typeof o.hooks.duringBarrier === 'function') o.hooks.duringBarrier({ holder: holder, plan_hash: plan.plan_hash, snapshot_path: snapshot.path });
 
     // 5) 先物化任务完整 payload（含即将被删的 messages/guard/verification/review），再动数据库
@@ -859,6 +871,7 @@ export function applyArchive(db, policy, plan, options) {
     const finish = releaseDrain(db, true);
     if (!finish.ok) throw new Error('commit_failed: ' + (finish.message || finish.reason));
     inBarrier = false; committed = true;
+    emitHook(o, 'barrier_out', { committed: true });
 
     // 7) 提交成功后才删日志（引用已归档 + hash 匹配 + 路径在 logs 内），二次核对 hash
     const logs = deletePlannedLogs(plan, o);

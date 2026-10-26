@@ -251,6 +251,42 @@ try {
       ok('非 WAL：EXCLUSIVE 期间连读都被挡（这才是 IMMEDIATE 与 EXCLUSIVE 的真正差别）', probe.exclusive_read.indexOf('blocked') === 0, probe.exclusive_read);
     }
   }
+  console.log('');
+  console.log('[10] 屏障顺序取证：integrity/快照必须在屏障之外完成');
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-barrier-'));
+    const db = S.openDb(path.join(dir, 'bus.db'));
+    try {
+      S.setRuntimeState(db, 'human', true);
+      const t = S.createTask(db, { title: '顺序取证', status: 'open', project: 'proj-order' });
+      db.prepare("UPDATE tasks SET status='done', updated_at=? WHERE id=?").run('2020-01-01T00:00:00.000Z', t.id);
+      S.recordUsage(db, 'worker/main', t.id, 'execute', 5, 5);
+      db.prepare('UPDATE token_usage SET ts=?').run('2020-01-01T00:00:00.000Z');
+      const policy = { lead: 'lead/main', permissions: {}, global: {}, economics: { budget_timezone: 'UTC' }, retention: { terminal_task_days: 30, message_days: 30, guard_event_days: 30, raw_usage_days: 30, log_days: 0 }, agents: {} };
+      const plan = buildPlan(db, policy, { now: NOW, logsDir: path.join(dir, 'logs') });
+      const events = [];
+      const applied = applyArchive(db, policy, plan, {
+        confirm: plan.plan_hash, archiveDir: path.join(dir, 'arch'), logsDir: path.join(dir, 'logs'), now: NOW,
+        hooks: { event: function (name, payload, at) { events.push({ name: name, at: at }); } },
+      });
+      ok('取证钩子记录了完整序列', applied.ok === true && events.length >= 4, events.map(function (e) { return e.name; }));
+      const names = events.map(function (e) { return e.name; });
+      const at = function (n) { const hit = events.filter(function (e) { return e.name === n; })[0]; return hit ? hit.at : null; };
+      ok('integrity_done 早于 barrier_in（integrity 真的不在屏障内）', at('integrity_done') !== null && at('barrier_in') !== null && at('integrity_done') <= at('barrier_in'), { integrity: at('integrity_done'), barrier: at('barrier_in') });
+      ok('snapshot_done 也早于 barrier_in', at('snapshot_done') !== null && at('snapshot_done') <= at('barrier_in'), { snapshot: at('snapshot_done'), barrier: at('barrier_in') });
+      ok('barrier_in 早于 barrier_out 且提交成功', names.indexOf('barrier_in') < names.indexOf('barrier_out') && events.filter(function (e) { return e.name === 'barrier_out'; })[0].at >= at('barrier_in'));
+      // 结构证据（比时间戳更强的因果）：屏障之后的代码里根本不存在快照/完整性调用。
+      const srcText = fs.readFileSync(new URL('./archive.mjs', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+      const applyStart = srcText.indexOf('export function applyArchive');
+      const applyEnd = srcText.indexOf('\nexport function ', applyStart + 10);
+      const applySrc = srcText.slice(applyStart, applyEnd > applyStart ? applyEnd : srcText.length);
+      const iBarrier = applySrc.indexOf("emitHook(o, 'barrier_in'");
+      const iSnapshot = applySrc.indexOf('takeSnapshot(');
+      ok('结构：takeSnapshot 调用出现在 barrier_in 之前', iSnapshot >= 0 && iBarrier > iSnapshot, { iSnapshot, iBarrier });
+      ok('结构：屏障之后没有任何 takeSnapshot 调用', applySrc.indexOf('takeSnapshot(', iBarrier) < 0);
+      ok('结构：屏障之后没有任何 integrity_check', applySrc.indexOf('PRAGMA integrity_check', iBarrier) < 0);
+    } finally { db.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  }
   void db2;
 
   console.log('\n[8] policy-schema 声明契约：prune_unmanaged 不注入默认值、读路径不丢键');
