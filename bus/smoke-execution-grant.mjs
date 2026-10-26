@@ -20,8 +20,8 @@ const dbFile = path.join(tmp, 'bus.db');
 const placeholderPolicy = path.join(tmp, 'policy-placeholder.json');
 const placeholderBase = JSON.parse(fs.readFileSync(path.join(S.BUS_DIR, 'policy.json'), 'utf8'));
 placeholderBase.agents = Object.assign({}, placeholderBase.agents, {
-  'worker/main': { autonomy: 'auto', may_dispatch_to: ['*'], max_open_from_agents: 100, max_concurrent: 5 },
-  'other/main': { autonomy: 'auto', may_dispatch_to: ['*'], max_open_from_agents: 100, max_concurrent: 5 },
+  'worker/main': { autonomy: 'auto', may_dispatch_to: ['*'], max_open_from_agents: 100, max_concurrent: 50 },
+  'other/main': { autonomy: 'auto', may_dispatch_to: ['*'], max_open_from_agents: 100, max_concurrent: 50 },
 });
 fs.writeFileSync(placeholderPolicy, JSON.stringify(placeholderBase));
 process.env.BUS_POLICY_PATH = placeholderPolicy;
@@ -31,6 +31,8 @@ const policy = { permissions: { reassign: ['human'], accept: ['human'] } };
 let pass = 0;
 function check(name, fn) { fn(); pass++; console.log('PASS '+name); }
 function task(extra = {}) { return S.createTask(db, { title:'grant task', project, status:'open', ...extra }); }
+// 该套件多轮 check 会累积占用 claimed 槽位（口径已改为 claimed + in_progress），
+// 所以这里把自家临时 policy 的 max_concurrent 提到 50 —— 只是夹具前提，不改任何产品语义。
 function claimed(extra = {}) { const t = task(extra); const c = S.claim(db,'worker/main',t.id); assert(c.ok); return c.task; }
 try {
   check('no claim, owner mismatch, expired lease and stale version cannot issue',()=>{

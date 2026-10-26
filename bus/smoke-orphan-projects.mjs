@@ -188,7 +188,15 @@ try {
     let aoJson = null;
     try { aoJson = JSON.parse(ao.stdout); } catch (e) { aoJson = null; }
     ok('archive-orphan dry-run 退出码 0 且给出 plan_hash', ao.code === 0 && !!aoJson && typeof aoJson.plan_hash === 'string', [ao.code, String(ao.stdout).slice(0, 140)]);
-    ok('archive-orphan dry-run 标明计划是全局范围', !!aoJson && !!aoJson.plan_scope_global && typeof aoJson.plan_scope_global.tasks === 'number', aoJson && aoJson.plan_scope_global);
+    // 规范形状（唯一）：scope {type,project_id} + plan_counts {tasks,outside_project,messages,guard_events,token_usage}
+    const counts = aoJson && aoJson.plan_counts;
+    ok('archive-orphan dry-run 只给规范形状：scope + plan_counts',
+      !!aoJson && !!aoJson.scope && aoJson.scope.type === 'project' && aoJson.scope.project_id === 'cli-adopt' &&
+      !!counts && typeof counts.tasks === 'number' && typeof counts.outside_project === 'number' &&
+      typeof counts.messages === 'number' && typeof counts.guard_events === 'number' && typeof counts.token_usage === 'number' &&
+      aoJson.plan_scope_global === undefined,
+      aoJson && { scope: aoJson.scope, plan_counts: aoJson.plan_counts, has_legacy_field: aoJson.plan_scope_global !== undefined });
+    ok('项目维度计划里不属于本项目的候选为 0', !!counts && counts.outside_project === 0, counts && counts.outside_project);
     const aoBad = await runCli(['projects', 'archive-orphan', '--project', 'cli-adopt', '--confirm', 'not-the-hash', '--json']);
     let aoBadJson = null;
     try { aoBadJson = JSON.parse(aoBad.stdout); } catch (e) { aoBadJson = null; }

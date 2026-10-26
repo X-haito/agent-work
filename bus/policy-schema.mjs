@@ -33,7 +33,7 @@ export const POLICY_SCHEMA = [
   { path: 'agents.*.autonomy', type: 'autonomy', default: 'off', stage: 'dispatch', status: 'enforced', owner: 'lead', editable: true, note: '派发数据层守卫' },
   { path: 'agents.*.may_dispatch_to', type: 'strings', default: [], stage: 'dispatch', status: 'enforced', owner: 'lead', editable: true, note: '派发数据层守卫' },
   { path: 'agents.*.max_open_from_agents', type: 'integer', bounds: [0, 10], default: 0, stage: 'dispatch', status: 'enforced', owner: 'lead', editable: true, note: '派发数据层守卫' },
-  { path: 'agents.*.max_concurrent', type: 'integer', bounds: [1, 5], default: 1, stage: 'dispatch', status: 'enforced', owner: 'item-7', editable: true, note: '数据层：claim 并发上限 / write_scope 必须命中 allowlist（smoke-limits 覆盖）' },
+  { path: 'agents.*.max_concurrent', type: 'integer', bounds: [1, 5], default: 1, stage: 'dispatch', status: 'enforced', owner: 'item-7', editable: true, note: '并发执行槽上限。占用口径 = claimed + in_progress（已认领未开始也占槽，防止先抢后做绕过配额）；review 不占执行槽' },
   { path: 'agents.*.scope_allowlist', type: 'strings', default: [], stage: 'dispatch', status: 'enforced', owner: 'item-7', editable: true, note: '数据层：claim 并发上限 / write_scope 必须命中 allowlist（smoke-limits 覆盖）' },
   { path: 'agents.*.capabilities', type: 'strings', default: [], stage: 'config', status: 'enforced', owner: 'lead', editable: true, note: '能力元数据用于提示与看板，不限制权限' },
   { path: 'network.default', type: 'literal:deny', default: 'deny', stage: 'dispatch', status: 'enforced', owner: 'item-6', editable: true, registry: false, note: '第 6 项：网络默认拒绝（只允许字面量 deny）' },

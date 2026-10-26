@@ -10,6 +10,17 @@ for (const f of [TDB, TDB + '-wal', TDB + '-shm']) { try { fs.unlinkSync(f); } c
 
 const db = S.openDb(TDB);
 S.setRuntimeState(db, 'human', true);
+
+// 夹具需要：同一个 agent 连续认领多张卡做状态机/租约用例。真实 policy.json 的 max_concurrent 可能只有 1，
+// 而 claim 是**重新读 policy** 的（不是用下面的内存副本），所以这里给本套件一份临时 policy 副本：
+// 除 max_concurrent 提到 20 外完全照抄，既让夹具成立，又不放宽任何产品语义。
+const REAL_POLICY_FILE = path.join(S.BUS_DIR, 'policy.json');
+const TMP_POLICY_FILE = path.join(os.tmpdir(), 'agentbus-smoke-policy-' + process.pid + '.json');
+const policyCopy = JSON.parse(fs.readFileSync(REAL_POLICY_FILE, 'utf8'));
+for (const id of Object.keys(policyCopy.agents || {})) policyCopy.agents[id].max_concurrent = 20;
+fs.writeFileSync(TMP_POLICY_FILE, JSON.stringify(policyCopy, null, 2));
+process.env.BUS_POLICY_PATH = TMP_POLICY_FILE;
+
 const policy = S.loadPolicy();
 const LEAD = policy.lead;                       // 谁是 Lead 由 policy 决定
 const ACC = policy.permissions.accept;

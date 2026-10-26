@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import * as ProjectRegistry from './project-registry.mjs';
 import fs from 'node:fs';
 import { migrateDb } from './migrations.mjs';
 import { normalizeRoots } from './execution-grant.mjs';
@@ -784,13 +785,17 @@ function claimLocked(db, agent, taskId, leaseMin) {
   if (!registered && agent !== 'human') {
     return { ok: false, reason: 'unknown_agent', message: agent + ' 不在策略的 agents 列表中，不能认领任务（先登记并按 max_concurrent 配置）' };
   }
-  // max_concurrent：按"执行中"计数——已认领但未开始的卡不占执行槽。
+  // max_concurrent（第 9 项）：口径是 claimed + in_progress —— 已认领但还没开始也算占槽，
+  // 否则"先 claim 十张再慢慢做"可以绕过配额；review 不占执行槽（不在下面的 IN 列表里）。
   if (registered) {
+    // 先回收自己名下已过期的 lease：过期占用不该把配额锁死（同一个事务里做，避免竞态）。
+    db.prepare("UPDATE tasks SET owner=NULL, status='open', lease_until=NULL, version=version+1, updated_at=? WHERE owner=? AND status='claimed' AND lease_until IS NOT NULL AND lease_until < ?")
+      .run(nowIso(), agent, nowIso());
     const cfg = policy.agents[agent] || {};
     const cap = Number.isSafeInteger(cfg.max_concurrent) && cfg.max_concurrent > 0 ? cfg.max_concurrent : 1;
-    const running = Number(db.prepare("SELECT COUNT(*) AS c FROM tasks WHERE owner = ? AND status = 'in_progress'").get(agent).c);
+    const running = Number(db.prepare("SELECT COUNT(*) AS c FROM tasks WHERE owner = ? AND status IN ('claimed','in_progress')").get(agent).c);
     if (running >= cap) {
-      return { ok: false, reason: 'max_concurrent', message: agent + ' 已有 ' + running + ' 个执行中的任务，达到上限 ' + cap };
+      return { ok: false, reason: 'max_concurrent', message: agent + ' 已有 ' + running + ' 个已认领/执行中的任务，达到上限 ' + cap };
     }
   }
 
@@ -982,22 +987,19 @@ function latestVerification(db, taskId) {
   } catch (error) { return null; }
 }
 
-// Peer reviewer：在线、非 owner、非 Lead，按 active 评审数最少、agent id 排序（确定性）
-function onlinePeerCandidates(db, policy, task) {
-  const lead = (policy && policy.lead) || null;
+// Peer reviewer（第 8 项）：pool = policy agents ∩ project agents ∩ online − owner − lead。
+// 项目资格由 project-registry（只读、无 store 依赖）解析；项目未登记/没声明 agent/没人在线一律不补人。
+function peerCandidateReport(db, policy, task) {
   let online = [];
   try {
     online = listAgents(db).filter(function (a) { return a.status && a.status !== 'offline'; }).map(function (a) { return a.agent_id; });
   } catch (error) { online = []; }
-  const configured = Object.keys((policy && policy.agents) || {});
-  const pool = online.length ? online : [];
-  const candidates = [];
-  for (const agent of pool) {
-    if (agent === lead || agent === 'human') continue;
-    if (task && task.owner === agent) continue;
-    if (configured.length && configured.indexOf(agent) < 0) continue;
-    candidates.push(agent);
-  }
+  const registry = ProjectRegistry.readRegistry(mergeRegistryFile({}));
+  return ProjectRegistry.eligibleAgents({ policy: policy, registry: registry, task: task, online: online });
+}
+
+function onlinePeerCandidates(db, policy, task) {
+  const candidates = peerCandidateReport(db, policy, task).eligible.slice();
   return candidates.sort(function (a, b) {
     const ca = Number(db.prepare("SELECT COUNT(*) AS c FROM reviews WHERE reviewer = ? AND status = 'active'").get(a).c) || 0;
     const cb = Number(db.prepare("SELECT COUNT(*) AS c FROM reviews WHERE reviewer = ? AND status = 'active'").get(b).c) || 0;
@@ -1027,6 +1029,14 @@ function assignReviewLocked(db, policy, taskId, options) {
   else if (routing.route === 'human') reviewer = 'human';
   else reviewer = onlinePeerCandidates(db, policy, task)[0] || null;
 
+  // peer 路由但没有合格候选：保持 pending，一次性升级给 Human（UNIQUE(task_id,kind) 保证只升一次），绝不从全局池补人。
+  let unassigned = null;
+  if (routing.route === 'peer' && !reviewer) {
+    const report = peerCandidateReport(db, policy, task);
+    unassigned = { reason: report.reason, detail: report.detail || null, project: report.project || null, excluded: report.excluded || [] };
+    escalateWithEvent(db, policy, taskId, 'review_unassigned',
+      '任务 ' + taskId + ' 需要 Peer 评审但没有合格候选（' + (report.reason || 'unknown') + '）：' + (report.detail || '') + '；已保留 pending，等人处理');
+  }
   const id = 'rv-' + newId();
   const ts = nowIso();
   db.prepare('INSERT INTO reviews(id,task_id,reviewer,route,status,task_version,verdict,summary,lease_until,created_at,updated_at) VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?)')
