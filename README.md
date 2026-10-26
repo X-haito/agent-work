@@ -236,3 +236,12 @@ node bus/smoke-docs.mjs                 # 校验文档与运行时一致
 ## 当前限制
 
 AgentBus 仍是本地优先的早期版本。身份认证、严格执行隔离、预算硬限制、配置字段完整落地、MCP 标准化返回和发布流程仍需完善，详见 [dsh-todo-list.md](dsh-todo-list.md)。
+
+
+### 测试隔离合同（第 11 项）
+
+- **新套件必须用 `bus/smoke-support/bootstrap.mjs`**：先 `assertEnvironmentComplete` 再动态 `import()` 状态模块。
+- 老套件沿用显式临时路径（`S.openDb(tmp)` / 自己设 `BUS_*`），由运行期守卫兜底。
+- 两种写法**不等价**：静态 import 会冻结模块层路径（`LIFECYCLE_FILE` 等），守卫会在使用点抛错；bootstrap 从根上避免这件事。
+- `AGENTBUS_TEST_GUARD=1` 下，任何指向真实 `bus.db` / `policy.json` / `projects.json` / `lifecycle.json` 的解析都立即抛 `IsolationError`。
+- 套件环境由 `bus/smoke-support/env.mjs` 的 `suiteEnv(dir,{port})` 生成：独立临时目录 + 四个状态变量 + 动态端口（`listen(0)`，禁止写死）。

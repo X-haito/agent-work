@@ -9,10 +9,15 @@ import * as Env from './smoke-support/env.mjs';
 import { pathToFileURL } from 'node:url';
 import { fingerprint, sameContent, describe } from './smoke-support/db-fingerprint.mjs';
 
-let pass = 0, fail = 0;
+let pass = 0, fail = 0, skip = 0;
 function ok(name, cond, extra) {
   if (cond) { pass++; console.log('  PASS  ' + name); }
   else { fail++; console.log('  FAIL  ' + name + (extra === undefined ? '' : '  -> ' + JSON.stringify(extra).slice(0, 300))); }
+}
+// 非目标平台一律 SKIP（绝不当 PASS）：SKIP 就是"本机没有证据"，CI matrix 的 macos-latest 才有。
+function skipped(name, why) {
+  skip++;
+  console.log('  SKIP  ' + name + (why ? ' （' + why + '）' : ''));
 }
 function throwsIsolation(fn) {
   try { fn(); return { threw: false }; }
@@ -169,13 +174,47 @@ console.log('[8] 真实库只用语义指纹比对，不做字节比较');
 ok('真实 bus.db 逻辑内容未变（sameContent + fingerprint）', sameContent(dbBefore, fingerprint(REAL_DB)), describe(dbBefore));
 
 console.log('');
-console.log('[9] 平台权限断言：不把别的平台结果当 macOS 证据');
+console.log('[9] 平台文件权限（darwin 分支为真断言；非 darwin 打印 SKIP，绝不当 PASS）');
 const perms = await import('./platform/file-permissions.mjs');
 ok('file-permissions 导出 harden/verify（三平台共用同一入口）', typeof perms.harden === 'function' && typeof perms.verify === 'function');
-ok('本机（' + process.platform + '）只断言自身平台', process.platform !== 'darwin', process.platform);
-
+const isDarwin = process.platform === 'darwin';
+const permDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-perm-'));
+if (!isDarwin) {
+  skipped('owner 是当前用户（仅 darwin 执行）', 'platform=' + process.platform);
+  skipped('harden 后 mode 为 0600（仅 darwin 执行）', 'platform=' + process.platform);
+  skipped('verify 拒绝 0644（仅 darwin 执行）', 'platform=' + process.platform);
+  skipped('harden 是逐文件而非目录继承（仅 darwin 执行）', 'platform=' + process.platform);
+  skipped('rename 后权限保持（仅 darwin 执行）', 'platform=' + process.platform);
+} else {
+  const target = path.join(permDir, 'secret.json');
+  fs.writeFileSync(target, '{"token":"x"}');
+  fs.chmodSync(target, 0o644);
+  const hardened = perms.harden(target);
+  const st = fs.statSync(target);
+  ok('owner 是当前用户（仅 darwin 执行）', st.uid === process.getuid(), { uid: st.uid, mine: process.getuid() });
+  ok('harden 后 mode 为 0600（仅 darwin 执行）', hardened.ok === true && (st.mode & 0o777) === 0o600, (st.mode & 0o777).toString(8));
+  ok('verify 通过 hardened 的文件（仅 darwin 执行）', perms.verify(target).ok === true);
+  const loose = path.join(permDir, 'loose.json');
+  fs.writeFileSync(loose, '{"token":"y"}');
+  fs.chmodSync(loose, 0o644);
+  ok('verify 拒绝 0644（仅 darwin 执行）', perms.verify(loose).ok === false, perms.verify(loose).detail);
+  // 继承：在同一个目录里新建文件不会自动变 0600（harden 是逐文件行为，不是目录策略）
+  const sibling = path.join(permDir, 'sibling.json');
+  fs.writeFileSync(sibling, 'z');
+  const siblingMode = fs.statSync(sibling).mode & 0o777;
+  ok('harden 是逐文件而非目录继承：同目录新建文件仍按 umask（仅 darwin 执行）', (siblingMode & 0o077) !== 0 || siblingMode === 0o600, siblingMode.toString(8));
+  ok('目录本身不会因为 harden 文件而收窄（仅 darwin 执行）', (fs.statSync(permDir).mode & 0o777) !== 0, (fs.statSync(permDir).mode & 0o777).toString(8));
+  // rename 后权限是否保持
+  const renamed = path.join(permDir, 'secret-renamed.json');
+  fs.renameSync(target, renamed);
+  const afterRename = fs.statSync(renamed).mode & 0o777;
+  ok('rename 后权限保持 0600（仅 darwin 执行）', afterRename === 0o600, afterRename.toString(8));
+  ok('rename 后 verify 仍然通过（仅 darwin 执行）', perms.verify(renamed).ok === true, perms.verify(renamed).detail);
+}
+ok('本机平台如实记录（不把别的平台结果当 macOS 证据）', perms.FILE_PERMISSIONS_PLATFORM === (process.platform === 'win32' ? 'win32' : process.platform), perms.FILE_PERMISSIONS_PLATFORM);
+try { fs.rmSync(permDir, { recursive: true, force: true }); } catch (e) {}
 try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
 console.log('');
 console.log('==================================');
-console.log('PASS ' + pass + '   FAIL ' + fail);
+console.log('PASS ' + pass + '   FAIL ' + fail + '   SKIP ' + skip);
 process.exitCode = fail ? 1 : 0;

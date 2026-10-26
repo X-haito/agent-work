@@ -4,6 +4,10 @@
 import { assertEnvironmentComplete } from './isolation-guard.mjs';
 import { suiteEnv, allocatePort } from './env.mjs';
 
+// 约定（第 11 项）：**新套件必须用本模块**；老套件沿用显式临时路径（S.openDb(tmp) / 自己设 BUS_*），
+// 由 isolation-guard 的运行期守卫兜底。两者**不等价**：静态 import 会冻结模块层路径（LIFECYCLE_FILE 等），
+// 守卫只能在"使用点"抓住它；bootstrap 从根上避免。
+//
 // 用法：const { store, adminConfig, consoleServer } = await bootstrap(tmpDir);
 // 返回的模块保证是在隔离环境生效之后才载入的。
 export async function bootstrap(dir, options) {
