@@ -268,8 +268,14 @@ console.log('\n[10] release-check：打包检查能拦住敏感文件');
   ok('PID 文件被拦下', bad.violations.some(function (v) { return v.rule === 'pidfile'; }), bad.violations.filter(function (v) { return v.rule === 'pidfile'; }).map(function (v) { return v.path; }));
   ok('每个违规都写明原因', bad.violations.every(function (v) { return typeof v.why === 'string' && v.why.length > 0; }));
   const report = await RC.runReleaseCheck({ root: path.resolve(S.BUS_DIR, '..'), skipSmoke: true, exec: async function () { return { code: 1, stdout: '', stderr: 'stub', error: null }; } });
-  ok('release-check 结构完整（版本 + 4 个步骤 + 计数）',
-    report.version === CLI.readVersion() && report.steps.length === 4 && typeof report.counts.fail === 'number', report.steps.map(function (s) { return s.id + ':' + s.status; }));
+  // 步骤数随检查项增加而变，但**必需的这几项一个都不能少**——按 id 断言，不按数量断言。
+  const REQUIRED_STEPS = ['pack_inspection', 'doctor', 'project_readiness', 'smoke', 'npm_pack'];
+  const stepIds = report.steps.map(function (s) { return s.id; });
+  ok('release-check 结构完整（版本 + 必需步骤齐全 + 计数）',
+    report.version === CLI.readVersion()
+      && REQUIRED_STEPS.every(function (id) { return stepIds.indexOf(id) >= 0; })
+      && typeof report.counts.fail === 'number',
+    report.steps.map(function (s) { return s.id + ':' + s.status; }));
 }
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) {}
 console.log('\nPASS ' + pass + '   FAIL ' + fail);

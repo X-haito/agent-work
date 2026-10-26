@@ -131,7 +131,11 @@ try {
         const err = path.join(tmp, 'w-' + tag + '.err');
         const fdOut = fs.openSync(out, 'w');
         const fdErr = fs.openSync(err, 'w');
-        const child = spawn(process.execPath, [worker, c.file, policyFile, planFile, archiveDir, logsDir], { stdio: ['ignore', fdOut, fdErr], windowsHide: true });
+        // 每个 worker 用**各自的快照目录**：本测试要测的是「同一 DB 的租约竞争」，
+        // 不该被「两人同时写同一个快照文件名」这种无关碰撞干扰（那是假红来源）。
+        const ownDir = path.join(tmp, 'snap-' + tag);
+        fs.mkdirSync(ownDir, { recursive: true });
+        const child = spawn(process.execPath, [worker, c.file, policyFile, planFile, ownDir, logsDir], { stdio: ['ignore', fdOut, fdErr], windowsHide: true });
         child.on('close', function () {
           try { fs.closeSync(fdOut); } catch (e) {}
           try { fs.closeSync(fdErr); } catch (e) {}

@@ -42,7 +42,15 @@ process.env.BUS_DB = dbFile;
 process.env.BUS_POLICY_PATH = policyPath;
 process.env.BUS_LIFECYCLE = path.join(tmp, 'lifecycle.json');
 process.env.BUS_PROJECTS = path.join(tmp, 'projects.json');
-fs.writeFileSync(process.env.BUS_PROJECTS, JSON.stringify({ projects: {} }));
+// 启动门禁要求"有 active 任务的项目必须登记且有非 Lead、非 owner 的潜在 reviewer"，
+// 所以这里铺一个合法 registry（这本来就是真实部署该有的样子）。
+const projectDirs = {};
+for (const id of ['proj-demo', 'proj-web', 'proj-infra']) {
+  projectDirs[id] = path.join(tmp, 'ws', id);
+  fs.mkdirSync(projectDirs[id], { recursive: true });
+  fs.writeFileSync(path.join(projectDirs[id], 'project.json'), JSON.stringify({ agents: ['claude/main', 'dsh/main'] }));
+}
+fs.writeFileSync(process.env.BUS_PROJECTS, JSON.stringify({ projects: Object.keys(projectDirs).map(function (id) { return [id, { path: projectDirs[id], agents: ['claude/main', 'dsh/main'] }]; }).reduce(function (acc, kv) { acc[kv[0]] = kv[1]; return acc; }, {}) }, null, 2));
 
 const S = await import('./store.mjs');
 const CS = await import('./console-server.mjs');
@@ -62,8 +70,14 @@ for (const p of projects) {
 S.send(db, { sender: LEAD, to: Object.keys(policy.agents)[0], kind: 'note', body: '浏览器验收用消息', policy: policy });
 db.close();
 
-const server = CS.startConsole({ port: await Env.allocatePort(), actor: 'human', dbPath: dbFile, policyPath: policyPath });
-await new Promise(function (resolve) { setTimeout(resolve, 300); });
+// 第 3 项修好后可以直接让系统分配端口：port:0 不再被当成空值。
+const server = CS.startConsole({ port: 0, actor: 'human', dbPath: dbFile, policyPath: policyPath });
+await new Promise(function (resolve, reject) {
+  if (server.listening) return resolve();
+  server.once('listening', resolve);
+  server.once('error', reject);
+  setTimeout(function () { reject(new Error('board_listen_timeout')); }, 10000);
+});
 const PORT = server.address().port;
 const BASE = 'http://127.0.0.1:' + PORT;
 const TOKEN = server.agentBus.bootstrap && server.agentBus.bootstrap.token;

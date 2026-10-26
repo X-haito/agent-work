@@ -1,5 +1,6 @@
 // Agent Bus 本地管理控制台。只监听 127.0.0.1；所有写操作经过数据层守卫与配置校验。
 import http from 'node:http';
+import * as ProjectRegistry from './project-registry.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -923,14 +924,48 @@ export function lifecycleSnapshot(db, options) {
   };
 }
 
+export const DEFAULT_BOARD_PORT = 7400;
+
+// 端口解析（第 3 项）：只有"没给"才用默认值；显式 0 是合法的"让系统分配"，不能被当成空值。
+// 非法值返回可操作的错误，不静默回退——静默回退会让人以为服务在 7400，其实在别处。
+export function resolveBoardPort(value) {
+  if (value == null || value === '') return { ok: true, port: DEFAULT_BOARD_PORT, explicit: false };
+  const num = Number(value);
+  if (!Number.isInteger(num) || num < 0 || num > 65535) {
+    return { ok: false, reason: 'invalid_port',
+      message: '端口必须是 0-65535 的整数（收到 ' + JSON.stringify(value) + '）；传 0 表示让系统分配，留空表示用 ' + DEFAULT_BOARD_PORT };
+  }
+  return { ok: true, port: num, explicit: true };
+}
+
 export function startConsole(options) {
   const opts = options || {};
-  const port = Number(opts.port || 7400);
+  const resolved = resolveBoardPort(opts.port);
+  if (!resolved.ok) {
+    const err = new Error(resolved.message);
+    err.reason = resolved.reason;
+    throw err;
+  }
+  const port = resolved.port;
   const actor = opts.actor || 'human';
   const server = createBoardServer({ port: port, actor: actor, dbPath: opts.dbPath, policyPath: opts.policyPath, projectOptions: opts.projectOptions });
+  // 第 9 项：启动即门禁。项目 registry 不合格（有 active 任务却没登记 / 没有潜在 reviewer 等）
+  // 就拒绝启动，而不是让人以为服务起来了、任务却永远卡在 pending 评审。
+  if (opts.allowUnreadyProjects !== true) {
+    const audit = ProjectRegistry.auditProjects(server.agentBus.db, S.loadPolicy(), {});
+    if (!audit.ok) {
+      try { server.close(); } catch (error) {}
+      try { server.agentBus.db.close(); } catch (error) {}
+      const err = new Error('项目 registry 未就绪（fail-closed）：' + audit.errors.map(function (f) { return (f.project || '-') + '/' + f.code + ' ' + f.message; }).join('；'));
+      err.reason = 'project_readiness_failed';
+      err.audit = audit;
+      throw err;
+    }
+  }
   S.reapLeases(server.agentBus.db, true);
   server.listen(port, '127.0.0.1', function () {
-    const bound = server.address() && server.address().port || port;
+    // listen(0) 之后真实端口只认 address()，绝不回退打印 0。
+    const bound = server.address().port;
     process.stderr.write('[board] http://127.0.0.1:' + bound + '  actor=' + actor + '\n');
     // 一次性登录链接只在这里打印一次；不写日志文件、不进响应体、不入审计。
     if (server.agentBus.bootstrap.token) {

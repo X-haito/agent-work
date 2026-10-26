@@ -4,6 +4,7 @@
 //   node bus/cli.mjs add-project <id> <绝对路径>
 //   node bus/cli.mjs init-project <id>
 import crypto from 'node:crypto';
+import * as ProjectRegistry from './project-registry.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import * as S from './store.mjs';
@@ -535,6 +536,42 @@ function archive() {
 
 // 认证就绪检查（第 5 项第 12 条）：三个已启用客户端都要有 active 凭据 + 配置文件 ACL 合格。
 // 不 ready 时**禁止**把 require_credentials 置 true —— 这里只负责判定，卡点在 admin-config.validatePolicy。
+// 第 9 项：项目 registry 上线门禁。一次列出**所有**不合格项目，逐条给修复命令；有 error 就是 fail-closed。
+function doctorProjectReadiness() {
+  const jsonOut = process.argv.indexOf('--json') >= 0;
+  const PR = ProjectRegistry;
+  const audit = PR.auditProjects(db, policy, { online: null });
+  if (jsonOut) {
+    console.log(JSON.stringify(audit, null, 2));
+    if (!audit.ok) process.exitCode = 1;
+    return;
+  }
+  console.log('项目 readiness（registry: ' + (audit.file || '未配置') + '）');
+  console.log('  项目 ' + audit.totals.projects + ' 个 · error ' + audit.totals.errors + ' · warning ' + audit.totals.warnings);
+  for (const project of audit.projects) {
+    const mark = project.status === 'error' ? 'FAIL' : (project.status === 'warning' ? 'WARN' : 'OK  ');
+    console.log('  [' + mark + '] ' + project.id + (project.path ? '  ' + project.path : ''));
+    if (project.agents && project.agents.length) console.log('        agents: ' + project.agents.join(', '));
+    const reviewers = (project.reviewers || []).filter(function (r) { return r.reviewers.length; });
+    if (reviewers.length) console.log('        潜在 reviewer: ' + reviewers.map(function (r) { return (r.owner || '-') + ' → ' + r.reviewers.join('/'); }).join(' · '));
+  }
+  if (audit.findings.length) {
+    console.log('');
+    for (const f of audit.findings) {
+      console.log('  ' + (f.level === 'error' ? 'ERROR' : 'WARN ') + ' [' + f.code + ']' + (f.project ? ' ' + f.project + '：' : ' ') + f.message);
+      if (f.fix) console.log('        修法: ' + f.fix);
+    }
+  }
+  if (!audit.ok) {
+    console.log('');
+    console.log('项目 registry 未就绪（fail-closed）：先处理上面的 ERROR 再启动或打包。');
+    process.exitCode = 1;
+    return;
+  }
+  console.log('');
+  console.log('就绪：所有 active 项目都有绝对路径、合法 agent 和至少一个非 Lead、非 owner 的潜在 reviewer。');
+}
+
 function doctorAuthReadiness() {
   const profiles = AdminConfig.readMcpProfiles();
   const readiness = S.authReadiness(db, {
@@ -1032,6 +1069,21 @@ function doctorProbeEngine() {
 // 状态文件与看板共用一份：console-server 里的 lifecycle* 函数是唯一实现，这里只做 CLI 接线 + 进程操作。
 async function lifecycleModule() { return import('./console-server.mjs'); }
 
+// 第 9 项：启动前置门禁。registry 不合格就不启动，并把每条修法打出来。
+function assertProjectReadiness(allowUnready) {
+  if (allowUnready === true) return;
+  const audit = ProjectRegistry.auditProjects(db, policy, {});
+  if (audit.ok) return;
+  console.error('拒绝启动：项目 registry 未就绪（fail-closed）');
+  for (const f of audit.errors) {
+    console.error('  ERROR [' + f.code + ']' + (f.project ? ' ' + f.project + '：' : ' ') + f.message);
+    if (f.fix) console.error('        修法: ' + f.fix);
+  }
+  console.error('');
+  console.error('先修上面这些（或临时用 agentbus start --allow-unready-projects），再启动看板。');
+  process.exit(1);
+}
+
 function lifecycleArg(name) {
   const args = process.argv.slice(3);
   const i = args.indexOf('--' + name);
@@ -1089,6 +1141,8 @@ async function lifecycleStart() {
     process.exitCode = 2;
     return;
   }
+  // 第 9 项：启动前置门禁（fail-closed）。不合格就不启动，避免"服务在跑但任务永远等不到评审"。
+  assertProjectReadiness(process.argv.indexOf('--allow-unready-projects') >= 0);
   const state = LC.readLifecycle();
   const board = LC.componentState(state.components.board);
   if (board.running) {
@@ -1445,6 +1499,7 @@ function doctorBudgetReadiness() {
 function doctor() {
   const args = process.argv.slice(3);
   if (args.indexOf('--auth-readiness') >= 0) { doctorAuthReadiness(); return; }
+  if (args.indexOf('--project-readiness') >= 0) { doctorProjectReadiness(); return; }
   if (args.indexOf('--probe-engine') >= 0) { doctorProbeEngine(); return; }
   if (args.indexOf('--budget-readiness') >= 0) { doctorBudgetReadiness(); return; }
   if (args.indexOf('--orphan-projects') >= 0) { doctorOrphanProjects(); return; }

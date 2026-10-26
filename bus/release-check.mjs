@@ -161,6 +161,24 @@ export async function runReleaseCheck(options) {
     detail: (initOk ? '' : 'agentbus init 失败（全新安装不可用）exit=' + initRun.code + '；stderr 尾部: ' + String(initRun.stderr || initRun.error || '').split('\n').slice(-6).join(' / ').slice(-600) + '；stdout 尾部: ' + String(initRun.stdout || '').split('\n').slice(-6).join(' / ').slice(-600) + '；') + doctorDetail + '（在临时 HOME 里先 init 再诊断）',
     fix: doctorOk ? null : (failingChecks.length ? failingChecks.map(function (c) { return c.fix; }).filter(Boolean).join(' / ') : '按 agentbus doctor 的修复命令逐项处理后再发布') });
 
+  // 第 9 项：项目 registry 上线门禁。用**真实的** registry 与真实库检查（不是临时 HOME），
+  // 因为这一项的意义就是"这台机器上的项目配置能不能支撑派活与评审"。
+  const readinessRun = await exec(process.execPath, [cli, 'doctor', '--project-readiness', '--json'], { cwd: root });
+  let readiness = null;
+  try { readiness = JSON.parse(String(readinessRun.stdout || '').slice(String(readinessRun.stdout || '').indexOf('{'))); } catch (e) { readiness = null; }
+  const readinessOk = !!readiness && readiness.ok === true;
+  const readinessErrors = readiness && Array.isArray(readiness.errors) ? readiness.errors : [];
+  steps.push({
+    id: 'project_readiness',
+    title: '项目 registry 门禁（doctor --project-readiness）',
+    status: readinessOk ? (Number(readiness && readiness.totals && readiness.totals.warnings) > 0 ? 'warn' : 'ok') : 'fail',
+    detail: readiness
+      ? ('项目 ' + (readiness.totals ? readiness.totals.projects : 0) + ' · error ' + (readiness.totals ? readiness.totals.errors : 0) + ' · warning ' + (readiness.totals ? readiness.totals.warnings : 0)
+        + (readinessErrors.length ? '；不合格: ' + readinessErrors.map(function (f) { return (f.project || '-') + '/' + f.code; }).join(', ') : ''))
+      : ('无法解析输出（退出码 ' + readinessRun.code + '）：' + String(readinessRun.stderr || readinessRun.error || '').slice(0, 160)),
+    fix: readinessOk ? null : ((readiness && readiness.fixes && readiness.fixes.length) ? readiness.fixes.join(' / ') : 'node bus/cli.mjs doctor --project-readiness'),
+  });
+
   if (o.skipSmoke === true) {
     steps.push({ id: 'smoke', title: '全量 smoke', status: 'skip', detail: '按 --skip-smoke 跳过', fix: null });
   } else {
