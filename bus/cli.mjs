@@ -197,7 +197,7 @@ async function projectsArchiveOrphan() {
     else { console.log('拒绝: ' + refused.message); for (const id of refused.active_task_ids) console.log('  - ' + id); }
     process.exitCode = 1; return;
   }
-  const plan = Archive.buildPlan(db, policy, {});
+  const plan = Archive.buildPlan(db, policy, { project: project });
   const projectTaskIds = new Set(rows.map(function (r) { return r.id; }));
   const inPlan = (plan.tables.tasks.ids || []).filter(function (id) { return projectTaskIds.has(id); });
   const outside = (plan.tables.tasks.ids || []).filter(function (id) { return !projectTaskIds.has(id); });
@@ -205,24 +205,25 @@ async function projectsArchiveOrphan() {
     ok: true, project: project, dry_run: confirm == null,
     project_tasks: rows.length, project_tasks_in_plan: inPlan.length, project_task_ids: inPlan.slice(0, 50),
     plan_hash: plan.plan_hash,
-    plan_scope_global: { tasks: (plan.tables.tasks.ids || []).length, outside_project: outside.length,
+    scope: plan.scope,
+    plan_counts: { tasks: (plan.tables.tasks.ids || []).length, outside_project: outside.length,
       messages: plan.tables.messages.candidates, guard_events: plan.tables.guard_events.candidates,
       token_usage: plan.tables.token_usage.candidates },
   };
   if (confirm == null) {
     if (jsonOut) { console.log(JSON.stringify(summary, null, 2)); return; }
-    console.log('项目归档 dry-run（复用全局 archive 计划，不自己删）');
+    console.log('项目归档 dry-run（只含本项目 ' + project + ' 的计划，不自己删）');
     console.log('  项目: ' + project + ' · 任务 ' + rows.length + '（本项目进入计划 ' + inPlan.length + '）');
     console.log('  计划 hash: ' + plan.plan_hash);
-    console.log('  注意: 这个 hash 覆盖的是**全局**保留计划 —— 任务 ' + summary.plan_scope_global.tasks +
-      '（其中不属于本项目 ' + outside.length + '）· 消息 ' + summary.plan_scope_global.messages +
-      ' · 守卫事件 ' + summary.plan_scope_global.guard_events + ' · 用量 ' + summary.plan_scope_global.token_usage);
+    console.log('  计划范围: 项目 ' + project + '（scope 参与 plan_hash）· 任务 ' + summary.plan_counts.tasks +
+      ' · 消息 ' + summary.plan_counts.messages + ' · 守卫事件 ' + summary.plan_counts.guard_events +
+      ' · 用量 ' + summary.plan_counts.token_usage + '；不属于本项目的候选 ' + outside.length + '（应为 0）');
     if (inPlan.length) for (const id of inPlan.slice(0, 20)) console.log('    - ' + id);
     console.log('');
-    console.log('确认执行（会按全局计划归档）: node bus/cli.mjs projects archive-orphan --project ' + project + ' --confirm ' + plan.plan_hash);
+    console.log('确认执行（只归档本项目）: node bus/cli.mjs projects archive-orphan --project ' + project + ' --confirm ' + plan.plan_hash);
     return;
   }
-  const applied = Archive.applyArchive(db, policy, plan, { confirm: confirm });
+  const applied = Archive.applyArchive(db, policy, plan, { confirm: confirm, project: project });
   const result = Object.assign({}, summary, { dry_run: false, applied: applied });
   if (jsonOut) { console.log(JSON.stringify(result, null, 2)); if (!applied.ok) process.exitCode = 1; return; }
   if (!applied.ok) { console.log('归档被拒: ' + applied.reason); console.log('  ' + JSON.stringify(applied).slice(0, 300)); process.exitCode = 1; return; }

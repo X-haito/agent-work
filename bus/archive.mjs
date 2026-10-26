@@ -77,10 +77,12 @@ function classifyExpiredRows(db, input) {
   const pending = input.pendingTaskIds || new Set();
 
   function bucket(rows, ownerKey) {
-    const out = { managed: [], deferred: [], unmanaged: [], skipped_active: [] };
+    const out = { managed: [], deferred: [], unmanaged: [], skipped_active: [], out_of_scope: [] };
     for (const row of rows) {
       const owner = row[ownerKey] == null ? null : String(row[ownerKey]);
       const status = owner == null ? undefined : taskStatus.get(owner);
+      // 项目计划只处理"属于该项目任务"的行：无 task_id 的历史用量/消息一律 out_of_scope（不删、不算孤儿）
+      if (input.scopeTaskIds && (owner == null || !input.scopeTaskIds.has(owner))) { out.out_of_scope.push(row); continue; }
       if (status === undefined) { out.unmanaged.push(row); continue; }
       if (ACTIVE_STATUSES.has(status)) { out.skipped_active.push(row); continue; }
       if (pending.has(owner)) { out.managed.push(row); continue; }
@@ -149,6 +151,8 @@ function minMax(rows, pick) {
 
 // 只有"引用任务已归档 + 文件 hash 与 artifact_refs 一致 + 路径在 bus/logs 内"的日志才是候选
 function logCandidates(db, retention, cutoff, options) {
+  // 项目范围：只考虑属于该项目任务的 artifact 引用。
+  const scopeTaskIds = options && options.scopeTaskIds ? options.scopeTaskIds : null;
   const dir = logsDirOf(options);
   const entries = [];
   const skipped = [];
@@ -157,6 +161,7 @@ function logCandidates(db, retention, cutoff, options) {
     refs = db.prepare('SELECT r.task_id, r.kind, r.relative_path, r.sha256, r.size FROM artifact_refs r JOIN task_archives a ON a.task_id = r.task_id').all();
   } catch (error) { refs = []; }
   for (const ref of refs) {
+    if (scopeTaskIds && !scopeTaskIds.has(String(ref.task_id))) continue;
     const rel = String(ref.relative_path || '');
     if (!rel || path.isAbsolute(rel) || rel.split(/[\\/]/).indexOf('..') >= 0) { skipped.push({ task_id: ref.task_id, relative_path: rel, reason: 'path_escape' }); continue; }
     const full = path.join(dir, rel);
@@ -193,10 +198,16 @@ export function buildPlan(db, policy, options) {
   const body = inReadSnapshot(db, function () {
     const tables = {};
 
+    // 第 2 项：项目范围。计划一旦生成就定死在这个项目上，apply 阶段不得再扩展为全局候选。
+    const scopeProject = o.project ? String(o.project) : null;
+    const scopeTaskIds = scopeProject ? new Set(db.prepare('SELECT id FROM tasks WHERE project = ?').all(scopeProject).map(function (row) { return String(row.id); })) : null;
     // 已终结任务先算出来：消息/守卫事件的归类要知道"本轮会归档哪些任务"
     const taskCut = cutoffOf(retention.terminal_task_days, now);
+    const taskSelect = 'SELECT id, status, version, updated_at FROM tasks WHERE ';
     const taskRows = taskCut
-      ? db.prepare('SELECT id, status, version, updated_at FROM tasks WHERE status IN ' + TERMINAL + ' AND updated_at < ? AND id NOT IN (SELECT task_id FROM task_archives) ORDER BY id').all(taskCut)
+      ? (scopeProject
+        ? db.prepare(taskSelect + 'project = ? AND status IN ' + TERMINAL + ' AND updated_at < ? AND id NOT IN (SELECT task_id FROM task_archives) ORDER BY id').all(scopeProject, taskCut)
+        : db.prepare(taskSelect + 'status IN ' + TERMINAL + ' AND updated_at < ? AND id NOT IN (SELECT task_id FROM task_archives) ORDER BY id').all(taskCut))
       : [];
     const taskRange = minMax(taskRows, function (row) { return row.updated_at; });
     tables.tasks = {
@@ -210,6 +221,7 @@ export function buildPlan(db, policy, options) {
       msgCut: msgCut,
       guardCut: guardCut,
       pendingTaskIds: new Set(tables.tasks.ids),
+      scopeTaskIds: scopeTaskIds,
     });
     const msgRange = rangeList(expired.messages.managed);
     tables.messages = { candidates: expired.messages.managed.length, earliest: msgRange.earliest, latest: msgRange.latest, ids: idList(expired.messages.managed, 'seq'), rows: expired.messages.managed };
@@ -224,9 +236,13 @@ export function buildPlan(db, policy, options) {
 
     // 原始用量：计划里就带上 id + 折叠所需的全部字段（含 day_key），执行阶段不再查询
     const usageCut = cutoffOf(retention.raw_usage_days, now);
+    // 项目范围：只处理**该项目任务**的用量。无 task_id 的历史用量不进项目归档——
+    // 否则一次「项目归档」会把别的项目的过期用量一起折叠/删除（跨项目污染）。
+    const usageScopeSql = scopeProject ? ' AND u.task_id IS NOT NULL AND u.task_id IN (SELECT id FROM tasks WHERE project = ?)' : '';
+    const usageParams = scopeProject ? [usageCut, scopeProject] : [usageCut];
     const usageRows = usageCut
       ? db.prepare("SELECT u.id, u.agent, COALESCE(t.project,'') AS project, COALESCE(u.task_id,'') AS task_id, u.tokens_in, u.tokens_out, u.ts " +
-        'FROM token_usage u LEFT JOIN tasks t ON t.id = u.task_id WHERE u.ts < ? AND (u.task_id IS NULL OR u.task_id NOT IN (SELECT id FROM tasks WHERE status IN ' + ACTIVE + ')) ORDER BY u.id').all(usageCut)
+        'FROM token_usage u LEFT JOIN tasks t ON t.id = u.task_id WHERE u.ts < ? AND (u.task_id IS NULL OR u.task_id NOT IN (SELECT id FROM tasks WHERE status IN ' + ACTIVE + '))' + usageScopeSql + ' ORDER BY u.id').all(...usageParams)
       : [];
     const groups = new Map();
     let usageTotal = 0;
@@ -247,7 +263,7 @@ export function buildPlan(db, policy, options) {
       total_tokens: usageTotal, groups: Array.from(groups.values()),
     };
 
-    const logs = logCandidates(db, retention, cutoffOf(retention.log_days, now), o);
+    const logs = logCandidates(db, retention, cutoffOf(retention.log_days, now), Object.assign({}, o, { scopeTaskIds: scopeTaskIds }));
     tables.artifact_refs = {
       candidates: logs.entries.length, earliest: null, latest: null,
       entries: logs.entries, skipped: logs.skipped,
@@ -269,6 +285,7 @@ export function buildPlan(db, policy, options) {
       referenced_logs: logs.entries.map(function (x) { return x.relative_path; }),
       skipped_active: skippedActive,
       est_bytes: taskBytes + logs.entries.reduce(function (n, x) { return n + (Number(x.size) || 0); }, 0),
+      scope: scopeProject ? { type: 'project', project_id: scopeProject } : { type: 'global' },
       prune_unmanaged: retention.prune_unmanaged,
       // 孤儿行与"等任务归档"的行单列上报：这两类默认都不删
       unmanaged: {
@@ -682,6 +699,10 @@ export function applyArchive(db, policy, plan, options) {
   if (!plan || !plan.plan_hash || !plan.tables) return { ok: false, reason: 'plan_required' };
   if (o.confirm == null || String(o.confirm) !== String(plan.plan_hash)) return { ok: false, reason: 'confirm_mismatch', plan_hash: plan.plan_hash };
   if (Number(plan.plan_version) !== PLAN_VERSION) return { ok: false, reason: 'plan_version_unsupported', plan_version: plan.plan_version, need: PLAN_VERSION };
+  // 第 2 项：scope 必须与调用方声称的一致——A 项目的确认不能拿去跑 B 项目（也不能拿去跑全库）
+  const planScope = plan.scope && plan.scope.type === 'project' ? String(plan.scope.project_id) : null;
+  const callScope = o.project == null || o.project === '' ? null : String(o.project);
+  if (planScope !== callScope) return { ok: false, reason: 'scope_mismatch', plan_project: planScope, confirm_project: callScope, message: '项目范围不符：确认必须同时带上同一个 project_id，不能把 A 项目的 confirmation 用在 B 项目或全库上' };
   // 计划本身不可变：内容 hash 必须与计划自带的 plan_hash 一致（防止 dry-run 之后有人改计划文件）
   const recomputed = planBodyHash(plan);
   if (recomputed !== String(plan.plan_hash)) return { ok: false, reason: 'plan_tampered', plan_hash: plan.plan_hash, recomputed: recomputed };
