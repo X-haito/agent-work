@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import * as S from './store.mjs';
-import { buildPlan, applyArchive } from './archive.mjs';
+import { buildPlan, applyArchive, archiveReadiness } from './archive.mjs';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-scope-'));
 const archiveDir = path.join(tmp, 'archives');
@@ -129,6 +129,31 @@ try {
   const again = applyArchive(db, policy, planA, { confirm: planA.plan_hash, project: 'proj-a', archiveDir, logsDir, now: NOW });
   ok('同一计划重复执行不会二次删除', (again.ok === true || again.reason === 'plan_stale' || again.reason === 'nothing_to_do'), again);
   ok('B 的用量仍为 1（重复执行没有波及）', db.prepare('SELECT COUNT(*) AS c FROM token_usage WHERE id = ?').get(usageB).c === 1);
+
+  console.log('[8b] readiness 自建临时目录必须清理，显式目录必须保留');
+  const tmpDirs = function () {
+    try { return fs.readdirSync(os.tmpdir()).filter(function (n) { return n.indexOf('agentbus-readiness-') === 0; }).length; } catch (e) { return -1; }
+  };
+  const before = tmpDirs();
+  const readyOk = archiveReadiness(db, policy, { now: NOW });
+  ok('成功路径：snapshot_ephemeral=true 且 snapshot_dir 为 null（不返回已删路径）', readyOk.snapshot_ephemeral === true && readyOk.snapshot_dir === null && readyOk.snapshot_retained === false, { e: readyOk.snapshot_ephemeral, d: readyOk.snapshot_dir });
+  ok('成功路径：临时目录没有残留', tmpDirs() === before, { before, after: tmpDirs() });
+  const explicitDir = path.join(tmp, 'explicit-readiness');
+  fs.mkdirSync(explicitDir, { recursive: true });
+  const readyKept = archiveReadiness(db, policy, { now: NOW, archiveDir: explicitDir });
+  ok('显式 archiveDir：snapshot_retained=true 且目录仍在', readyKept.snapshot_retained === true && readyKept.snapshot_ephemeral === false && fs.existsSync(explicitDir), { k: readyKept.snapshot_retained });
+  ok('显式 archiveDir 里有快照文件（不是空壳）', fs.readdirSync(explicitDir).length > 0, fs.readdirSync(explicitDir));
+  // 失败路径：archiveDir 指向一个普通文件 → takeSnapshot 必然失败，仍不得泄漏临时目录。
+  const badDir = path.join(tmp, 'not-a-dir');
+  fs.writeFileSync(badDir, 'x');
+  const beforeBad = tmpDirs();
+  const readyBad = archiveReadiness(db, policy, { now: NOW, archiveDir: badDir });
+  ok('snapshot 失败路径：ready=false 且不泄漏临时目录', readyBad.ready === false && tmpDirs() === beforeBad, { ready: readyBad.ready, before: beforeBad, after: tmpDirs() });
+  // 异常路径：now 的 valueOf 抛错 → 走 finally。
+  const beforeThrow = tmpDirs();
+  let threw = false;
+  try { archiveReadiness(db, policy, { now: { valueOf: function () { throw new Error('boom'); } } }); } catch (e) { threw = true; }
+  ok('异常路径：抛错后临时目录仍被清理', threw === true && tmpDirs() === beforeThrow, { threw, before: beforeThrow, after: tmpDirs() });
 
   console.log('[9] fence：屏障内被接管后旧 worker 不得提交');
   const taskC = seedTask('proj-a', 'C 的旧任务');

@@ -354,9 +354,10 @@ export function archiveReadiness(db, policy, options) {
   // 一个承诺 applies_nothing 的命令**不得**往仓库里写东西：未指定目录时落临时目录。
   // （曾经默认写进真实 bus/archives/，演练时被实际踩到。）
   const readinessOptions = Object.assign({}, o);
-  if (!readinessOptions.archiveDir) {
-    readinessOptions.archiveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-readiness-'));
-  }
+  // 只清自己建的临时目录；调用方显式传入的 archiveDir 一律保留。
+  const createdTempDir = readinessOptions.archiveDir ? null : fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-readiness-'));
+  if (createdTempDir) readinessOptions.archiveDir = createdTempDir;
+  try {
   const snapshot = takeSnapshot(db, readinessOptions, now);
   steps.push({ step: 'snapshot', ok: snapshot.ok === true, detail: snapshot.ok ? { path: snapshot.path } : { reason: snapshot.reason, message: snapshot.message }, note: '只读快照，失败不阻塞' });
   const integrity = snapshot.ok ? verifySnapshotFile(snapshot.path) : { ok: false, detail: 'no_snapshot' };
@@ -365,13 +366,19 @@ export function archiveReadiness(db, policy, options) {
   steps.push({ step: 'dry_run', ok: true, detail: { plan_hash: plan.plan_hash, counts: plan.counts, unmanaged: plan.unmanaged, scope: plan.scope } });
   return {
     steps: steps,
-    snapshot_dir: readinessOptions.archiveDir,
+    snapshot_dir: createdTempDir ? null : readinessOptions.archiveDir,
+    snapshot_ephemeral: createdTempDir !== null,
+    snapshot_retained: createdTempDir === null,
     applies_nothing: true,
     retention_unchanged: JSON.stringify(retentionOf(policy)),
     plan_hash: plan.plan_hash,
     ready: steps.every(function (s) { return s.ok === true; }),
     next_step: '确认无误后再走 archive --confirm <plan_hash>（本项目要求 Human 亲手确认，never auto-apply）',
   };
+  } finally {
+    // 返回体里不会给出已删除的路径（snapshot_dir 置 null），避免调用方拿到失效路径。
+    if (createdTempDir) { try { fs.rmSync(createdTempDir, { recursive: true, force: true }); } catch (e) {} }
+  }
 }
 
 // 看板用轻量汇总：只做过期行的归类计数（不扫日志、不哈希、不写库）
