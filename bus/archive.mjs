@@ -9,6 +9,7 @@
 // 3. 只有 BEGIN EXCLUSIVE 才是"暂停新写入"（BEGIN IMMEDIATE 只排队，不阻止并发写）。
 // 4. 清理原始 token_usage 前必须先折叠进 token_usage_daily 并核对总和；查询层合并 daily + 未归档 raw。
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
@@ -309,6 +310,68 @@ export function buildPlan(db, policy, options) {
   });
 
   return body;
+}
+
+// 第 4 项阶段 A：预算基线（只度量，不改配置、不回填）
+// 归属率 = 有 task_id 的用量行 / 全部用量行；历史未归属单列 legacy_unattributed，绝不伪造回填。
+export function budgetReadiness(db, policy) {
+  const raw = db.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN task_id IS NULL OR task_id = '' THEN 1 ELSE 0 END) AS unattributed FROM token_usage").get();
+  const daily = db.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN task_id IS NULL OR task_id = '' THEN 1 ELSE 0 END) AS unattributed FROM token_usage_daily").get();
+  const total = Number(raw.total) || 0;
+  const unattributed = Number(raw.unattributed) || 0;
+  const tokenTotals = db.prepare("SELECT COALESCE(SUM(tokens_in + tokens_out),0) AS tokens, COALESCE(SUM(CASE WHEN task_id IS NULL OR task_id = '' THEN tokens_in + tokens_out ELSE 0 END),0) AS unattributed_tokens FROM token_usage").get();
+  const tokens = Number(tokenTotals.tokens) || 0;
+  const unattributedTokens = Number(tokenTotals.unattributed_tokens) || 0;
+  const e = (policy && policy.economics) || {};
+  return {
+    switches: {
+      daily_token_budget: e.daily_token_budget == null ? null : Number(e.daily_token_budget),
+      default_turn_reserve: e.default_turn_reserve == null ? null : Number(e.default_turn_reserve),
+      task_budget_tasks: Number(db.prepare('SELECT COUNT(*) AS c FROM tasks WHERE token_budget IS NOT NULL').get().c) || 0,
+    },
+    raw_usage: { rows: total, attributed: total - unattributed, unattributed: unattributed },
+    daily_usage: { rows: Number(daily.total) || 0, unattributed: Number(daily.unattributed) || 0 },
+    // 两种口径都给，并各自写清分母：单看 0.5 无法判断是 1/2 还是 5000/10000
+    attribution_rate_tokens: tokens > 0 ? Number(((tokens - unattributedTokens) / tokens).toFixed(4)) : null,
+    attribution_rate_rows: total > 0 ? Number(((total - unattributed) / total).toFixed(4)) : null,
+    denominators: { tokens: tokens, rows: total },
+    rate_basis: 'attribution_rate_tokens 是主口径（历史 75.2% 即按量加权）；attribution_rate_rows 是辅助口径',
+    legacy_unattributed: {
+      rows: unattributed,
+      note: '历史未归属用量（task_id 为空）只单列，不回填 task_id，也不计入任何项目的预算基线',
+    },
+    verdict: total === 0
+      ? '还没有任何用量记录：先把总线跑起来才有基线'
+      : (unattributed > 0 ? '存在历史未归属用量：定额前要先决定这些行的归属口径（不回填）' : '全部用量都带 task_id：可以直接按任务定额'),
+  };
+}
+
+// 第 4 项阶段 C：归档准备（快照 → integrity_check → dry-run）。只报告，不 apply、不改 retention。
+export function archiveReadiness(db, policy, options) {
+  const o = options || {};
+  const now = o.now ? new Date(o.now) : new Date();
+  const steps = [];
+  // 一个承诺 applies_nothing 的命令**不得**往仓库里写东西：未指定目录时落临时目录。
+  // （曾经默认写进真实 bus/archives/，演练时被实际踩到。）
+  const readinessOptions = Object.assign({}, o);
+  if (!readinessOptions.archiveDir) {
+    readinessOptions.archiveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-readiness-'));
+  }
+  const snapshot = takeSnapshot(db, readinessOptions, now);
+  steps.push({ step: 'snapshot', ok: snapshot.ok === true, detail: snapshot.ok ? { path: snapshot.path } : { reason: snapshot.reason, message: snapshot.message }, note: '只读快照，失败不阻塞' });
+  const integrity = snapshot.ok ? verifySnapshotFile(snapshot.path) : { ok: false, detail: 'no_snapshot' };
+  steps.push({ step: 'integrity_check', ok: integrity.ok === true, detail: integrity.detail || null });
+  const plan = buildPlan(db, policy, readinessOptions);
+  steps.push({ step: 'dry_run', ok: true, detail: { plan_hash: plan.plan_hash, counts: plan.counts, unmanaged: plan.unmanaged, scope: plan.scope } });
+  return {
+    steps: steps,
+    snapshot_dir: readinessOptions.archiveDir,
+    applies_nothing: true,
+    retention_unchanged: JSON.stringify(retentionOf(policy)),
+    plan_hash: plan.plan_hash,
+    ready: steps.every(function (s) { return s.ok === true; }),
+    next_step: '确认无误后再走 archive --confirm <plan_hash>（本项目要求 Human 亲手确认，never auto-apply）',
+  };
 }
 
 // 看板用轻量汇总：只做过期行的归类计数（不扫日志、不哈希、不写库）

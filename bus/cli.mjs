@@ -495,8 +495,26 @@ function unmanagedLine(plan, deleted) {
 }
 
 // archive --dry-run 只输出计划；--confirm <plan_hash> 才真正清理（hash 必须与本次计划一致）
+// 第 4 项阶段 C：archive readiness —— 快照 → integrity_check → dry-run，只报告，绝不 apply
+function archiveReadinessCommand() {
+  const args = process.argv.slice(3);
+  const jsonOut = args.indexOf('--json') >= 0;
+  // 未指定 --archive-dir 时 archiveReadiness 自己落临时目录：readiness 绝不往仓库写东西。
+  const dirAt = args.indexOf('--archive-dir');
+  const report = Archive.archiveReadiness(db, policy, dirAt >= 0 ? { archiveDir: args[dirAt + 1] } : {});
+  if (jsonOut) { console.log(JSON.stringify(report, null, 2)); return; }
+  console.log('归档 readiness（三步，只读；不会 apply、不会改 retention）');
+  for (const step of report.steps) console.log('  [' + (step.ok ? 'ok' : 'FAIL') + '] ' + step.step + (step.detail ? ' — ' + JSON.stringify(step.detail).slice(0, 200) : ''));
+  console.log('  计划: ' + JSON.stringify(report.steps[2].detail.counts));
+  console.log('  applies_nothing=' + report.applies_nothing + ' · retention=' + report.retention_unchanged);
+  if (report.snapshot_dir) console.log('  快照目录: ' + report.snapshot_dir + '（临时目录，仓库未写入）');
+  console.log('  下一步: ' + report.next_step);
+  if (!report.ready) process.exitCode = 1;
+}
+
 function archive() {
   const args = process.argv.slice(3);
+  if (args[0] === 'readiness') { archiveReadinessCommand(); return; }
   const confirmAt = args.indexOf('--confirm');
   const confirm = confirmAt >= 0 ? args[confirmAt + 1] : null;
   const targetDb = process.env.BUS_DB ? S.openDb(process.env.BUS_DB) : db;
@@ -1410,10 +1428,25 @@ function doctorOrphanProjects() {
   console.log('\n提示: 迁移用 node bus/cli.mjs projects adopt --legacy <旧> --id <新> --path <绝对路径>');
 }
 
+// 第 4 项阶段 A：预算基线（只报告；"存在未归属用量"是基线事实，不是错误 → 退出码 0）
+function doctorBudgetReadiness() {
+  const jsonOut = process.argv.indexOf('--json') >= 0;
+  const report = Archive.budgetReadiness(db, policy);
+  if (jsonOut) { console.log(JSON.stringify(report, null, 2)); return; }
+  const pct = function (v) { return v == null ? '—' : (v * 100).toFixed(1) + '%'; };
+  console.log('预算基线 readiness（只读，不改任何配置）');
+  console.log('  归属率（主口径·按量加权）: ' + pct(report.attribution_rate_tokens) + '  分母 ' + report.denominators.tokens + ' tokens');
+  console.log('  归属率（辅口径·按行数）  : ' + pct(report.attribution_rate_rows) + '  分母 ' + report.denominators.rows + ' 行');
+  console.log('  历史未归属（legacy_unattributed）: ' + report.legacy_unattributed.rows + ' 行（只上报，不回填 task_id）');
+  console.log('  开关: daily_token_budget=' + JSON.stringify(report.switches.daily_token_budget) + ' · default_turn_reserve=' + JSON.stringify(report.switches.default_turn_reserve) + ' · 带任务预算的任务 ' + report.switches.task_budget_tasks + ' 个');
+  console.log('  结论: ' + report.verdict);
+}
+
 function doctor() {
   const args = process.argv.slice(3);
   if (args.indexOf('--auth-readiness') >= 0) { doctorAuthReadiness(); return; }
   if (args.indexOf('--probe-engine') >= 0) { doctorProbeEngine(); return; }
+  if (args.indexOf('--budget-readiness') >= 0) { doctorBudgetReadiness(); return; }
   if (args.indexOf('--orphan-projects') >= 0) { doctorOrphanProjects(); return; }
   const jsonOut = args.indexOf('--json') >= 0;
   const homeAt = args.indexOf('--home');
