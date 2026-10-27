@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { writePolicyFixture } from './smoke-support/policy-fixture.mjs';
 
 let pass = 0, fail = 0;
 function ok(name, cond, detail) {
@@ -12,7 +13,7 @@ function ok(name, cond, detail) {
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-port-'));
 const BUS = path.dirname(new URL(import.meta.url).pathname).replace(/^\//, '');
 const policyPath = path.join(tmp, 'policy.json');
-fs.copyFileSync(path.join(BUS, 'policy.json'), policyPath);
+writePolicyFixture(policyPath, BUS);
 const dbFile = path.join(tmp, 'bus.db');
 process.env.BUS_DB = dbFile;
 process.env.BUS_POLICY_PATH = policyPath;

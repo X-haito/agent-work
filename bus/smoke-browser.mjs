@@ -5,6 +5,7 @@ import cp from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { writePolicyFixture } from './smoke-support/policy-fixture.mjs';
 
 let pass = 0, fail = 0, skip = 0;
 function ok(name, cond, detail) {
@@ -36,7 +37,7 @@ if (!BROWSER) {
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-browser-'));
 const policyPath = path.join(tmp, 'policy.json');
-fs.copyFileSync(path.join(path.dirname(new URL(import.meta.url).pathname).replace(/^\//, ''), 'policy.json'), policyPath);
+writePolicyFixture(policyPath);
 const dbFile = path.join(tmp, 'bus.db');
 process.env.BUS_DB = dbFile;
 process.env.BUS_POLICY_PATH = policyPath;

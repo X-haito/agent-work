@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fingerprint, sameContent, describe } from './smoke-support/db-fingerprint.mjs';
+import { writePolicyFixture } from './smoke-support/policy-fixture.mjs';
 
 let pass = 0, fail = 0;
 function ok(name, cond, detail) {
@@ -16,7 +17,7 @@ const realBefore = fs.existsSync(REAL_REGISTRY) ? fingerprint(REAL_REGISTRY) : n
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agentbus-ready-'));
 const registryFile = path.join(tmp, 'projects.json');
 const policyPath = path.join(tmp, 'policy.json');
-fs.copyFileSync(path.join(BUS, 'policy.json'), policyPath);
+writePolicyFixture(policyPath, BUS);
 const dbFile = path.join(tmp, 'bus.db');
 process.env.BUS_DB = dbFile;
 process.env.BUS_POLICY_PATH = policyPath;
@@ -89,6 +90,12 @@ ok('声明了 policy 里没有的 agent → warning（此时没有 active 任务
 activeTask('proj-good');
 const unknownAgentActive = audit();
 ok('同样的问题在项目有 active 任务时升级为 error（fail-closed）', unknownAgentActive.ok === false && codes(unknownAgentActive).indexOf('agent_not_in_policy') >= 0, codes(unknownAgentActive));
+// 第 2 项第 4 条：把未知 agent 改成 policy 里存在的身份后，warning 与 error 都必须消失。
+// （这正是 proj-demo 的 dsh/lead → dsh/main 修复方式：不为消除告警新造身份。）
+writeRegistry({ projects: { 'proj-good': { path: goodDir, agents: [WORKERS[0]] } } });
+const afterFix = audit();
+ok('修正为合法 agent 后不再报 agent_not_in_policy', codes(afterFix).indexOf('agent_not_in_policy') < 0, codes(afterFix));
+ok('修正后 proj-good 不再有任何 finding', findingsFor(afterFix, 'proj-good').length === 0, findingsFor(afterFix, 'proj-good'));
 
 console.log('');
 console.log('[6] 没有非 Lead、非 owner 的潜在 reviewer → error');
