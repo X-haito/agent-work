@@ -152,16 +152,33 @@ export function verify(filePath, options) {
   if (!entries.length) return { ok: false, method: 'icacls', detail: '解析不出任何 ACL 条目: ' + text.slice(0, 200) };
   // Windows 的账户名比较不区分大小写（icacls 常输出 RUNNERADMIN\runneradmin，而 whoami 给 runneradmin\runneradmin）。
   const lower = function (v) { return String(v || '').toLowerCase(); };
-  const self = [user.sid, user.name, user.name ? user.name.split('\\').pop() : null].filter(Boolean).map(lower);
+  // whoami 可能只给用户名（runneradmin），icacls 却给 BUILTIN\\runneradmin —— 必须按末段比较，
+  // 否则会把当前用户自己当成「额外受托人」（真实踩到：verify 误判为不合格）。
+  const bare = function (v) { const parts = lower(v).split('\\'); return parts[parts.length - 1]; };
+  const self = [user.sid, user.name].filter(Boolean).map(lower);
+  const selfBare = [user.name].filter(Boolean).map(bare);
+  const isSelf = function (principal) { return self.indexOf(lower(principal)) >= 0 || selfBare.indexOf(bare(principal)) >= 0; };
   const others = [];
+  const matched = [];
   let inherited = false;
   for (const entry of entries) {
     if (/\(I\)/.test(entry.rights) || /inherited/i.test(entry.rights)) inherited = true;
-    if (self.indexOf(lower(entry.principal)) < 0) others.push(entry.principal);
+    if (!isSelf(entry.principal)) others.push(entry.principal);
+    else matched.push(entry.principal);
   }
-  if (inherited) return { ok: false, method: 'icacls', detail: '仍存在继承来的 ACL（应关闭继承）' };
-  if (others.length) return { ok: false, method: 'icacls', detail: '存在额外受托人: ' + Array.from(new Set(others)).slice(0, 5).join(', ') };
-  return { ok: true, method: 'icacls', detail: '仅 ' + (user.name || user.sid) + ' 可访问' };
+  // 结构化结果：安全属性必须能直接断言，**不要让人去解析本地化文案**。
+  // （曾经测试用 /S-1-/ 匹配 detail，而 icacls 可能把同一 SID 显示成 domain\\user → 误报失败。）
+  const structured = {
+    method: 'icacls',
+    expected_sid: user.sid || null,
+    expected_name: user.name || null,
+    matched_principals: Array.from(new Set(matched)),
+    inherited: inherited,
+    extra_principals: Array.from(new Set(others)),
+  };
+  if (inherited) return Object.assign({ ok: false, detail: '仍存在继承来的 ACL（应关闭继承）' }, structured);
+  if (others.length) return Object.assign({ ok: false, detail: '存在额外受托人: ' + Array.from(new Set(others)).slice(0, 5).join(', ') }, structured);
+  return Object.assign({ ok: true, detail: '仅 ' + (user.name || user.sid) + ' 可访问' }, structured);
 }
 
 export const FILE_PERMISSIONS_PLATFORM = IS_WIN ? 'win32' : process.platform;

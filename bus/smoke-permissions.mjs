@@ -60,6 +60,25 @@ ok('harden 用参数数组调用 icacls（不拼 shell 字符串）',
   JSON.stringify(calls));
 ok('harden 在 icacls 失败时不返回 ok:true',
   FP.harden(plainFile, { run: () => ({ status: 1, stdout: '', stderr: 'Access is denied.' }), user: fakeUser }).ok === false);
+// 第 1 项：verify 必须返回**结构化** ACL 结论，且同一 SID 以账户名显示时仍然通过。
+{
+  const aclFile = path.join(temp, 'acl-structured.json');
+  fs.writeFileSync(aclFile, '{}\n');
+  // 注意：路径与第一条 ACE 必须分行——stripPaths 会剥掉路径，同行会把 ACE 一起带走。
+  const base = function (aces) { return { status: 0, stdout: aclFile + '\n' + aces.join('\n') + '\n', stderr: '' }; };
+  // 同一 SID 被 icacls 显示成 domain\\user（本地化/解析差异）——不得因此判不合格。
+  const asName = FP.verify(aclFile, { run: function () { return base(['BUILTIN\\runneradmin:(F)']); }, user: { sid: 'S-1-5-21-1-2-3-500', name: 'runneradmin' } });
+  ok('verify：同一账户名（大小写/域名不同）仍判合格', asName.ok === true && asName.inherited === false && asName.extra_principals.length === 0, asName);
+  ok('verify：返回 expected_sid / expected_name / matched_principals', asName.expected_sid === 'S-1-5-21-1-2-3-500' && asName.expected_name === 'runneradmin' && asName.matched_principals.length === 1, asName);
+  // 额外 SYSTEM / Administrators 必须失败，并把它们列在 extra_principals 里。
+  const extra = FP.verify(aclFile, { run: function () { return base(['BUILTIN\\runneradmin:(F)', 'NT AUTHORITY\\SYSTEM:(F)', 'BUILTIN\\Administrators:(F)']); }, user: { sid: 'S-1-5-21-1-2-3-500', name: 'runneradmin' } });
+  ok('verify：额外 SYSTEM/Administrators 必须失败', extra.ok === false && extra.extra_principals.length === 2, extra);
+  ok('verify：失败时也带结构化字段（不是只有文案）', extra.inherited === false && Array.isArray(extra.matched_principals) && extra.matched_principals.length === 1, extra);
+  // 继承 ACE 必须失败并置 inherited=true。
+  const inh = FP.verify(aclFile, { run: function () { return base(['BUILTIN\\runneradmin:(F)', 'BUILTIN\\Users:(I)(RX)']); }, user: { sid: 'S-1-5-21-1-2-3-500', name: 'runneradmin' } });
+  ok('verify：继承 ACE 必须失败且 inherited=true', inh.ok === false && inh.inherited === true, inh);
+}
+
 ok('取不到 SID 时 harden 也 fail-closed',
   FP.harden(plainFile, { run: () => ({ status: 1, stdout: '', stderr: '' }) }).ok === false);
 const aceOk = FP.verify(plainFile, { run: () => ({ status: 0, stdout: plainFile + ' HOST\\tester:(F)\n', stderr: '' }), user: fakeUser });

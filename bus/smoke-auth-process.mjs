@@ -143,7 +143,14 @@ if (process.platform === 'win32') {
     skipped('Windows: verify 只授当前用户 SID（同上）', 'icacls_access_denied');
   } else {
     ok('Windows: harden 走 icacls 且成功', hardened.ok === true && hardened.method === 'icacls', hardened);
-    ok('Windows: verify 走 icacls 且只授当前用户 SID', verified.ok === true && verified.method === 'icacls' && /S-1-/.test(String(verified.detail)), verified);
+    // 断言**结构化安全属性**，不解析本地化文案：icacls 可能把同一 SID 显示成 domain\user。
+    ok('Windows: verify 走 icacls 且只授当前用户（结构化）',
+      verified.ok === true && verified.method === 'icacls'
+        && verified.inherited === false
+        && Array.isArray(verified.extra_principals) && verified.extra_principals.length === 0
+        && typeof verified.expected_sid === 'string' && verified.expected_sid.length > 0
+        && Array.isArray(verified.matched_principals) && verified.matched_principals.length > 0,
+      verified);
   }
   skipped('POSIX owner/mode/父目录（仅 Linux/macOS 执行）', 'platform=win32');
 } else {
